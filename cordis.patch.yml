@@ -1,0 +1,10 @@
+# Bundle patch: applied by dsh when this package is installed as a profile
+# bundle (`dsh plugin --profile <name> add dsh-plumb-identity`). Mounts the
+# identity plugin above the mcp-client rows; the tools-sync capture makes the
+# order irrelevant to correctness, but loading first keeps the DSH plugin
+# inventory tidy.
+- insert:
+    - id: dsh-plumb-identity
+      name: dsh-plumb-identity
+      config:
+        serverName: plumb

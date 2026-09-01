@@ -1,0 +1,46 @@
+{
+  "name": "dsh-plumb-identity",
+  "version": "0.1.0",
+  "description": "Per-agent plumb session identity for DeepSeek Harness: stamps and declares a stable plumb session id for every DSH conversation and subagent sharing one plumb MCP connection.",
+  "license": "MIT",
+  "type": "module",
+  "main": "dsh-plumb-identity.mjs",
+  "exports": {
+    ".": "./dsh-plumb-identity.mjs"
+  },
+  "files": [
+    "dsh-plumb-identity.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/plugin.test.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plumb",
+    "mcp",
+    "cordis",
+    "session",
+    "identity",
+    "subagent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/plumbkit/dsh-plumb-identity.git"
+  },
+  "bugs": {
+    "url": "https://github.com/plumbkit/dsh-plumb-identity/issues"
+  },
+  "homepage": "https://github.com/plumbkit/dsh-plumb-identity#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
