@@ -130,7 +130,12 @@ export function shouldSkip (config, env) {
 // the awaited imports swallow their errors.
 
 function defaultSdkRoot () {
-  return `${process.env.DSH_HOME ?? homedir()}/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm`
+  // Match dsh's own home resolution: an explicit $DSH_HOME IS the dsh home
+  // root; only the default gets the `.dsh` suffix (`~/.dsh`). Appending `.dsh`
+  // unconditionally made the SDK unimportable — and identity silently absent —
+  // whenever DSH_HOME pointed at a custom home.
+  const home = process.env.DSH_HOME ?? `${homedir()}/.dsh`
+  return `${home}/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm`
 }
 
 const moduleSdk = await import(`${defaultSdkRoot()}/client/index.js`).catch(() => null)
