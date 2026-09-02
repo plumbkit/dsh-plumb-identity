@@ -103,6 +103,22 @@ npm test
 
 Hermetic — no DSH, no plumb, no network (the MCP SDK is a stub fixture). `spike/probe.mjs` and `spike/observe.mjs` are the field diagnostics: mount either through a `--patch` overlay into a `dsh --profile headless` run to re-map DSH internals after an upgrade.
 
+### End-to-end against a fake model
+
+```sh
+npm run test:e2e
+```
+
+Verifies the full chain — real DSH agent loop, this plugin mounted from the working tree, real plumb — with only the MODEL scripted (`test/fake-model.mjs`, a local OpenAI-compatible server), so it spends **zero LLM credits** and touches no network beyond localhost. Each scenario runs in a throwaway `DSH_HOME` whose only configured provider is the local fake (a misrouted model request fails on "unknown provider" rather than billing a real key) against an isolated `plumb serve` whose `HOME`/`XDG` roots live under the scenario's temp dir — neither your DSH profile nor your plumb state is touched.
+
+Three scenarios, each asserting on plumb's own session records:
+
+- `tool-call` — one plumb tool call; a session with `purpose: dsh` and `external_id: dsh-*` must be declared.
+- `text-only` — no plumb tool call; nothing may be declared (the control).
+- `subagent` — the agent delegates a subagent that makes the plumb call; a `purpose: dsh-subagent` identity must be declared.
+
+Requirements: a `dsh` install (resolved from `$DSH_BIN`, else the `$DSH_HOME` / `~/.dsh` profile tree, exactly what dsh itself resolves) and a plumb binary (`$PLUMB_BIN`, else `../plumb/plumb` beside this checkout, else `plumb` on PATH). Run one scenario with `node test/e2e-mock-provider.mjs --mode subagent`; keep the temp dirs for debugging with `--keep` or `E2E_KEEP=1`.
+
 ## Interplay notes
 
 - A model that follows `~/.dsh/AGENTS.md` and calls `session_start` with its own id changes nothing: the per-call `_meta` stamp wins plumb's identity resolution, so the conversation stays under its minted id. Keep the AGENTS.md rules — they are the fallback when the plugin is absent and the path through which the model receives plumb's orientation packet.

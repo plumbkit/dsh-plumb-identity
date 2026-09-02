@@ -18,7 +18,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test test/plugin.test.mjs"
+    "test": "node --test test/plugin.test.mjs",
+    "test:e2e": "node test/e2e-mock-provider.mjs"
   },
   "keywords": [
     "dsh",
