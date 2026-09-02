@@ -34,9 +34,11 @@ dsh plugin --profile headless add dsh-plumb-identity
 
 The package ships a `dsh.bundle` patch, so installing the bundle also mounts the plugin with default config. Restart `dsh` (running processes do not re-read patch layers).
 
-### Manual patch row
+> **Pick one mount mechanism.** Installing the bundle *and* keeping a manual `insert` row with the same id crashes DSH at boot — `duplicate loader entry id: dsh-plumb-identity`. Patch layers merge config overrides by row id, but two inserts never merge. If you switch between the two, remove the other first (`dsh plugin --profile <name> remove dsh-plumb-identity`, or delete the row).
 
-If you prefer the user-global patch layer, append to `~/.dsh/cordis.patch.yml`:
+### Manual patch row (alternative to the bundle)
+
+Only if the bundle is **not** installed — append to `~/.dsh/cordis.patch.yml`:
 
 ```yaml
 - insert:
@@ -46,11 +48,16 @@ If you prefer the user-global patch layer, append to `~/.dsh/cordis.patch.yml`:
         serverName: plumb
 ```
 
-Disable any time by adding `disabled: true` to the row in a later patch layer, or remove the row.
+Remove the row, or disable it with an override row at the TOP LEVEL of any patch layer loaded after the one that mounts it (never inside an `insert` list — that would insert a nameless row):
+
+```yaml
+- id: dsh-plumb-identity
+  disabled: true
+```
 
 ### Local development
 
-Point the row at a checkout instead of the package name:
+Point the row at a checkout instead of the package name — and remove or disable the bundle mount first, per the warning above:
 
 ```yaml
 - insert:
