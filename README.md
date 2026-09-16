@@ -2,7 +2,7 @@
 
 Per-agent plumb session identity for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
-A [cordis](https://github.com/cordisjs/cordis) plugin that gives every DSH conversation, workspace, and in-process subagent its own stable [plumb](https://github.com/plumbkit/plumb) session identity — enforced at the transport layer, not by instruction. Developed and tested against `@deepseek-ai/dsh@0.1.1-rc.2` and plumb `0.17.x`.
+A [cordis](https://github.com/cordisjs/cordis) plugin that gives every DSH conversation, workspace, and in-process subagent its own stable [plumb](https://github.com/plumbkit/plumb) session identity — enforced at the transport layer, not by instruction. Developed and tested against `@deepseek-ai/dsh@0.1.1-rc.2` and plumb `0.17.x`; its field locations were re-verified by inspection on 2026-09-16 against `@deepseek-ai/dsh@0.1.5-rc.1` (MCP SDK 1.30.0) — see the compatibility note at the end for exactly what that does and does not claim.
 
 ## Why
 
@@ -82,6 +82,8 @@ Point the row at a checkout instead of the package name — and remove or disabl
 
 `excludeEnv` matters: pauta's dsh driver appends its own plumb linkage sentence (`pauta-dsh-<card>-<run>`), and a second identity for the same run would be noise.
 
+**Know what the exclusion costs.** An excluded run mounts nothing, so its plumb calls carry no identity at all. On a shared connection those anonymous calls resolve against the CONNECTION's pin, and a pin such a run sets is what seeds every other agent's shard — so a pauta run can leave a DSH conversation seeded on another workspace. Two things bound the damage: plumb refuses anonymous state-changing calls once two identities have been seen on the connection, and (since 2026-09-16 in plumb `main`) an agent whose declaration is refused is *gated* — its path-bearing calls are refused by name with the `force: true` remedy instead of quietly resolving into the seeded root. If you would rather the pauta run be attributed by this plugin, remove `PAUTA_RUN_ID` here and have the driver pass its run id through the same channels — but verify the driver's contract first; the blanket exclusion is deliberate, not an oversight.
+
 ## Verify
 
 ```sh
@@ -124,7 +126,8 @@ Requirements: a `dsh` install (resolved from `$DSH_BIN`, else the `$DSH_HOME` / 
 - A model that follows `~/.dsh/AGENTS.md` and calls `session_start` with its own id changes nothing: the per-call `_meta` stamp wins plumb's identity resolution, so the conversation stays under its minted id. Keep the AGENTS.md rules — they are the fallback when the plugin is absent and the path through which the model receives plumb's orientation packet.
 - A plumb connection keeps ONE session record; `external_id`/`purpose` in `plumb sessions` show the most recent declarer on that connection. Per-agent isolation is plumb's shard state (`pinned_workspace`/`read_tracking` keyed by `logical_agent_id`), not the session record.
 - Single-identity connections pin at connection level by design ("one declared id arms nothing"); sharding and per-agent pins engage from the second distinct identity, which is exactly the multi-workspace web case.
-- Compatibility is pinned to `@deepseek-ai/dsh@0.1.1-rc.2` field locations (`agent.id`, `agent.session.header.{cwd,parentSession,delegationDepth}`, the `tools/execute` waterfall, SDK `client/index.js`). If a DSH upgrade moves one of these, the plugin fails open loudly in the DSH log; re-run the spike probes to re-map, and please open an issue.
+- **A refused declaration is a failure, not a success.** plumb answers a refused `session_start` with an ordinary tool RESULT carrying `isError: true` — not a transport error — so a `try/catch` sees success. This plugin inspects the result, and lets plumb's own scope decide the recovery: `details.scope = "agent"` means `force: true` moves only this agent's shard, so it retries once with force; `details.scope = "connection"` means force would move the pin every agent on the connection resolves against, so it is reported and never forced automatically. Concurrent first calls from one agent share a single in-flight declaration.
+- Compatibility is pinned to `@deepseek-ai/dsh@0.1.1-rc.2` field locations (`agent.id`, `agent.session.header.{cwd,parentSession,delegationDepth}`, the `tools/execute` waterfall, SDK `client/index.js`). On 2026-09-16 those were re-verified by inspection against `@deepseek-ai/dsh@0.1.5-rc.1` with MCP SDK 1.30.0: live DSH conversations still appear in plumb's `pinned_workspace` rows under this plugin's minted ids, and the SDK's `ResultSchema` is a `z.looseObject` with `_meta` declared, so the failure envelope this plugin reads (`_meta["dev.plumbkit/error"]`) survives parsing. The spike probes were **not** re-run for 0.1.5-rc.1 and the tested target has not been bumped — treat 0.1.1-rc.2 as tested and 0.1.5-rc.1 as observed-working. If a DSH upgrade moves one of these, the plugin fails open loudly in the DSH log; re-run the spike probes to re-map, and please open an issue.
 
 ## License
 

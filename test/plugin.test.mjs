@@ -269,12 +269,68 @@ test('a refused declaration fails open and is retried on the next call', async (
     const result = await wrap(exec, async () => 'r2')
     assert.equal(result, 'r2', 'the call proceeds despite the failed declaration')
     assert.equal(requests.filter((r) => r.params.name === 'session_start').length, 0)
-    assert.ok(ctx.logs.some(([level, msg]) => level === 'warn' && msg.includes('failed')))
+    assert.ok(ctx.logs.some(([level, msg]) => level === 'warn' && msg.includes('could not be sent')))
     fixtureState.failSessionStart = false
     await wrap(exec, async () => 'r3')
     assert.equal(requests.filter((r) => r.params.name === 'session_start').length, 1, 'retry after failure')
   } finally {
     fixtureState.failSessionStart = false
+    await ctx.handlers.dispose?.()
+  }
+})
+
+// -- two agents on one connection ---------------------------------------------
+//
+// The shape the plugin exists for: ONE `plumb serve`, two DSH conversations in
+// two workspaces. Each must declare itself, keep its own identity on every call,
+// and — when plumb refuses one of them — the refusal must be handled per its
+// scope rather than for the connection as a whole.
+
+test('two conversations on one connection keep their own identity and outcome', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const agentA = { name: 'mcp__plumb__daemon_info', ...conversation('conv-a', '/w/a') }
+    const agentB = { name: 'mcp__plumb__workspace_sessions', ...conversation('conv-b', '/w/b') }
+
+    // One client — one `plumb serve` — captured by the first call's body.
+    await wrap(agentA, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'daemon_info', arguments: {} } }, { parse: (v) => v })
+      return 'r0'
+    })
+    // Agent A's own declaration lands.
+    await wrap(agentA, async () => 'r1')
+
+    // Agent B's declaration is refused at CONNECTION scope: force there would move
+    // the pin every agent on this connection resolves against, so it must not be
+    // sent automatically.
+    fixtureState.sessionStartRefusals = [{ kind: 'pin_refused', details: { scope: 'connection', pinned: '/w/a', requested: '/w/b' } }]
+    await wrap(agentB, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'workspace_sessions', arguments: {} } }, { parse: (v) => v })
+      return 'r2'
+    })
+
+    const declares = requests.filter((r) => r.params.name === 'session_start')
+    assert.equal(declares.length, 2, 'one declaration attempt per agent')
+    assert.deepEqual(declares.map((r) => r.params.arguments.session_id), ['dsh-w-a-conv-a', 'dsh-w-b-conv-b'])
+    assert.deepEqual(declares.map((r) => r.params.arguments.workspace), ['/w/a', '/w/b'])
+    assert.ok(declares.every((r) => r.params.arguments.force === undefined), 'no forced retry at connection scope')
+
+    // Every call carried its OWN agent id, so plumb attributed it correctly even
+    // though the two share one transport.
+    const stamped = requests.filter((r) => r.params._meta?.['dev.plumbkit/logical-agent'] !== undefined)
+    const ids = new Set(stamped.map((r) => r.params._meta['dev.plumbkit/logical-agent']))
+    assert.ok(ids.has('dsh-w-a-conv-a') && ids.has('dsh-w-b-conv-b'), `both agents stamped their own id: ${[...ids].join(', ')}`)
+
+    const warns = ctx.logs.filter(([level]) => level === 'warn')
+    assert.equal(warns.length, 1, 'the refusal is reported exactly once, for agent B')
+    assert.match(warns[0][1], /refused the declaration for dsh-w-b-conv-b/)
+    assert.match(warns[0][1], /connection pin belongs to another workspace/)
+  } finally {
+    fixtureState.sessionStartRefusals = []
     await ctx.handlers.dispose?.()
   }
 })
@@ -305,3 +361,95 @@ test('excluded environments never mount anything', async () => {
     delete process.env.PAUTA_RUN_ID
   }
 })
+
+// -- refused declarations -----------------------------------------------------
+//
+// A refusal is a normal tools/call RESULT whose isError is true, and plumb's
+// _meta envelope says WHICH pin it refused to move. The two scopes need
+// opposite handling, so these pin both.
+
+test('a connection-scope refusal is surfaced, never auto-forced, and not retried', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  fixtureState.sessionStartRefusals = [{
+    kind: 'pin_refused',
+    retryable: true,
+    remediation: { class: 'repin_workspace', tool: 'session_start' },
+    details: { scope: 'connection', pinned: '/w/other', requested: '/w/g' }
+  }]
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = { name: 'mcp__plumb__daemon_info', ...conversation('conv-conn', '/w/g') }
+    await wrap(exec, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'daemon_info', arguments: {} } }, { parse: (v) => v })
+      return 'r1'
+    })
+    await wrap(exec, async () => 'r2')
+    const declares = requests.filter((r) => r.params.name === 'session_start')
+    assert.equal(declares.length, 1, 'a connection-scope refusal is attempted once')
+    assert.equal(declares[0].params.arguments.force, undefined, 'force must never be sent at connection scope')
+    const warns = ctx.logs.filter(([level]) => level === 'warn')
+    assert.equal(warns.length, 1, 'reported exactly once')
+    assert.match(warns[0][1], /refused the declaration/)
+    assert.match(warns[0][1], /connection pin belongs to another workspace/)
+    await wrap(exec, async () => 'r3')
+    assert.equal(requests.filter((r) => r.params.name === 'session_start').length, 1, 'a refusal is not re-attempted every call')
+  } finally {
+    fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('an agent-scope refusal is retried exactly once with force, then counts as declared', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  fixtureState.sessionStartRefusals = [{ kind: 'pin_refused', retryable: true, details: { scope: 'agent', pinned: '/w/other', requested: '/w/h' } }]
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = { name: 'mcp__plumb__daemon_info', ...conversation('conv-agent', '/w/h') }
+    await wrap(exec, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'daemon_info', arguments: {} } }, { parse: (v) => v })
+      return 'r1'
+    })
+    await wrap(exec, async () => 'r2')
+    const declares = requests.filter((r) => r.params.name === 'session_start')
+    assert.equal(declares.length, 2, 'one plain attempt, one forced retry')
+    assert.equal(declares[0].params.arguments.force, undefined)
+    assert.equal(declares[1].params.arguments.force, true, 'agent scope is the only scope a forced retry is safe at')
+    assert.ok(ctx.logs.some(([level, msg]) => level === 'info' && msg.includes('after a per-agent re-pin refusal')))
+    assert.equal(ctx.logs.filter(([level]) => level === 'warn').length, 0, 'a recovered refusal is not a warning')
+    await wrap(exec, async () => 'r3')
+    assert.equal(requests.filter((r) => r.params.name === 'session_start').length, 2, 'a recovered declaration is not repeated')
+  } finally {
+    fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('two simultaneous first calls from one agent issue one declaration', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = { name: 'mcp__plumb__daemon_info', ...conversation('conv-race', '/w/i') }
+    await wrap(exec, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'daemon_info', arguments: {} } }, { parse: (v) => v })
+      return 'r1'
+    })
+    await Promise.all([
+      wrap(exec, async () => 'r2'),
+      wrap(exec, async () => 'r3'),
+      wrap(exec, async () => 'r4')
+    ])
+    assert.equal(requests.filter((r) => r.params.name === 'session_start').length, 1, 'concurrent first calls share one in-flight declaration')
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+

@@ -57,6 +57,13 @@ export const inject = ['tools']
 /** plumb's per-call identity key, from plumb's internal/mcp/meta_keys.go. */
 export const identityMetaKey = 'dev.plumbkit/logical-agent'
 
+/**
+ * plumb's machine-readable failure envelope, from plumb's internal/mcp/meta_keys.go.
+ * A refused declaration carries it on the tool RESULT's _meta — the envelope,
+ * not the error text, is what this plugin branches on.
+ */
+export const toolErrorMetaKey = 'dev.plumbkit/error'
+
 /** Defaults; every field is overridable from the patch row's `config`. */
 export function defaultConfig () {
   return {
@@ -163,7 +170,14 @@ export async function apply (ctx, config) {
   }
 
   const als = new AsyncLocalStorage()
-  const declared = new WeakMap() // Client instance -> Set of sessionIds declared on it
+  // Client instance -> Map<sessionId, Promise<boolean>>. The whole DECLARATION
+  // is memoised, not merely its success: two simultaneous first calls from one
+  // agent must not issue two session_starts, and a failed one must stay
+  // retryable on a later call without repeating on every call.
+  const declaring = new WeakMap()
+  // Client instance -> Set<sessionId> already reported, so a failure that keeps
+  // recurring does not become a warning on every plumb call.
+  const declarationNotified = new WeakMap()
   let plumbClientRef = null // WeakRef to the captured plumb Client
   let restorePatch = null
 
@@ -234,6 +248,122 @@ export async function apply (ctx, config) {
     }
   }
 
+  // -- Declaration -----------------------------------------------------------
+  //
+  // A refused declaration is NOT a transport failure. plumb answers a refused
+  // session_start with an ordinary tools/call result whose isError is true, so
+  // a try/catch around the request sees SUCCESS and records the agent as
+  // declared — which is what this code did until 2026-09-16, silently leaving
+  // the agent resolving relative paths, and git's default repository, against
+  // whichever workspace the CONNECTION was pinned to (another conversation's).
+  //
+  // The retry policy comes from plumb's own scope, never from the sentence:
+  //   scope 'agent'      — force: true moves only THIS agent's shard, so an
+  //                        automatic retry is safe and clears the refusal.
+  //   scope 'connection' — force: true moves the pin every agent on this
+  //                        connection resolves against, which may have been
+  //                        restored for another conversation. Never forced
+  //                        automatically; surfaced instead.
+
+  /** Records the first report for one (client, agent); false for every repeat. */
+  function noteDeclarationOnce (client, sessionId) {
+    let seen = declarationNotified.get(client)
+    if (seen === undefined) {
+      seen = new Set()
+      declarationNotified.set(client, seen)
+    }
+    if (seen.has(sessionId)) return false
+    seen.add(sessionId)
+    return true
+  }
+
+  /** One declaration request, optionally forcing it. Never stamped (see below). */
+  function sendDeclaration (client, agentContext, ident, resultSchema, force) {
+    const args = {
+      session_id: ident.id,
+      workspace: ident.workspace,
+      purpose: agentContext.isSubagent ? cfg.subagentPurpose : cfg.purpose,
+      detail: cfg.detail
+    }
+    if (force) args.force = true
+    return client.request({
+      method: 'tools/call',
+      params: { name: 'session_start', arguments: args }
+    }, resultSchema ?? { parse: (value) => value })
+  }
+
+  /**
+   * Declare one agent on one client. Deliberately OUTSIDE the identity scope:
+   * the request must travel unstamped so plumb reads the id from the
+   * ARGUMENTS — the channel its linkage, workspace pin and orientation packet
+   * are built around.
+   *
+   * Returns 'declared', 'refused' (plumb said no — do not retry blindly) or
+   * 'unreachable' (the request itself failed — a later call may retry).
+   */
+  async function declareOn (client, agentContext, ident, resultSchema) {
+    let result
+    try {
+      result = await sendDeclaration(client, agentContext, ident, resultSchema, false)
+    } catch (error) {
+      if (noteDeclarationOnce(client, agentContext.sessionId)) {
+        ctx.logger?.warn?.(`${name}: session_start for ${ident.id} could not be sent (${String(error).slice(0, 160)}); the call proceeds with the _meta stamp only and a later call will retry`)
+      }
+      return 'unreachable'
+    }
+    if (result?.isError !== true) {
+      ctx.logger?.info?.(`${name}: declared ${ident.id} (${ident.workspace}${agentContext.isSubagent ? ', subagent' : ''})`)
+      return 'declared'
+    }
+
+    const scope = result?._meta?.[toolErrorMetaKey]?.details?.scope
+    if (scope === 'agent') {
+      // Safe by construction: this moves only the declaring agent's own shard.
+      try {
+        const forced = await sendDeclaration(client, agentContext, ident, resultSchema, true)
+        if (forced?.isError !== true) {
+          ctx.logger?.info?.(`${name}: declared ${ident.id} after a per-agent re-pin refusal (force)`)
+          return 'declared'
+        }
+      } catch {
+        // Report it below with what is known; the refusal is the fact that matters.
+      }
+    }
+    if (noteDeclarationOnce(client, agentContext.sessionId)) {
+      const why = scope === 'connection'
+        ? 'the connection pin belongs to another workspace, and forcing it would move the pin every agent on this connection resolves against'
+        : scope === 'agent'
+          ? 'the forced per-agent retry was refused too'
+          : 'no machine-readable scope was reported'
+      ctx.logger?.warn?.(`${name}: plumb refused the declaration for ${ident.id} (${ident.workspace}) — ${why}. Until it is declared, workspace-dependent calls can resolve against another project: re-issue session_start with workspace + session_id + force: true, and prefer absolute paths meanwhile`)
+    }
+    return 'refused'
+  }
+
+  /**
+   * The memoised declaration for one (client, agent). Concurrent first calls
+   * share one promise, so two simultaneous calls cannot issue two
+   * declarations. A REFUSAL is kept (it needs a human or the model to act, and
+   * retrying every call would only add a round-trip); a request that never
+   * reached plumb is evicted so a later call retries it.
+   */
+  function declarationFor (client, agentContext, ident, resultSchema) {
+    let byId = declaring.get(client)
+    if (byId === undefined) {
+      byId = new Map()
+      declaring.set(client, byId)
+    }
+    let pending = byId.get(agentContext.sessionId)
+    if (pending === undefined) {
+      pending = declareOn(client, agentContext, ident, resultSchema).then((outcome) => {
+        if (outcome === 'unreachable') byId.delete(agentContext.sessionId)
+        return outcome === 'declared'
+      })
+      byId.set(agentContext.sessionId, pending)
+    }
+    return pending
+  }
+
   // -- Tool waterfall -------------------------------------------------------
   const unwrappedErrors = new Set()
   ctx.on('tools/execute', async (exec, next) => {
@@ -261,33 +391,7 @@ export async function apply (ctx, config) {
       // knows no identities and each must re-declare on it.
       const client = plumbClientRef?.deref()
       if (client !== undefined) {
-        let seen = declared.get(client)
-        if (seen === undefined) {
-          seen = new Set()
-          declared.set(client, seen)
-        }
-        if (!seen.has(agentContext.sessionId)) {
-          try {
-            await client.request({
-              method: 'tools/call',
-              params: {
-                name: 'session_start',
-                arguments: {
-                  session_id: ident.id,
-                  workspace: ident.workspace,
-                  purpose: agentContext.isSubagent ? cfg.subagentPurpose : cfg.purpose,
-                  detail: cfg.detail
-                }
-              }
-            }, resultSchema ?? { parse: (value) => value })
-            seen.add(agentContext.sessionId)
-            ctx.logger?.info?.(`${name}: declared ${ident.id} (${ident.workspace}${agentContext.isSubagent ? ', subagent' : ''})`)
-          } catch (error) {
-            // Fail open: the call proceeds with the _meta stamp only; plumb
-            // attributes it but the shard keeps the connection's workspace.
-            ctx.logger?.warn?.(`${name}: proactive session_start for ${ident.id} failed: ${String(error).slice(0, 200)}`)
-          }
-        }
+        await declarationFor(client, agentContext, ident, resultSchema)
       }
 
       return await als.run(ident, async () => next())
