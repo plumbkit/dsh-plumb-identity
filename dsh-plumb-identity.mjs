@@ -180,11 +180,23 @@ export async function apply (ctx, config) {
   const declarationNotified = new WeakMap()
   let plumbClientRef = null // WeakRef to the captured plumb Client
   let restorePatch = null
+  // Proof of DELIVERY, not of intent. The patch installing proves nothing: it
+  // can land on a class the running dsh-mcp-client never instantiates (a
+  // different @modelcontextprotocol package, or a different major of it), in
+  // which case every call travels unstamped while the plugin reports success.
+  // Counting routed calls against applied stamps is the only observation that
+  // distinguishes the two.
+  let plumbCallsRouted = 0
+  let stampsApplied = 0
+  let unstampedReported = false
 
   // -- Transport stamp ------------------------------------------------------
   // A config-supplied sdkPath is the override hatch for non-standard installs;
   // it re-introduces the apply-time import (and with it the connect race), so
   // the default path — resolved at module load, above — is the supported one.
+  // Named in the unstamped-call warning below: the path is the whole diagnosis
+  // when the patched class turns out not to be the one in use.
+  const sdkSource = config?.sdkPath ?? `${defaultSdkRoot()}/client/index.js`
   const sdk = config?.sdkPath
     ? await import(config.sdkPath).catch(() => null)
     : moduleSdk
@@ -227,6 +239,7 @@ export async function apply (ctx, config) {
               request.params = request.params ?? {}
               request.params._meta = { ...(request.params._meta ?? {}), [identityMetaKey]: ident.id }
               plumbClientRef = new WeakRef(this)
+              stampsApplied += 1
               if (cfg.logEvents) ctx.logger?.info?.(`${name}: stamped ${request.params.name} as ${ident.id}`)
             }
           }
@@ -394,7 +407,24 @@ export async function apply (ctx, config) {
         await declarationFor(client, agentContext, ident, resultSchema)
       }
 
-      return await als.run(ident, async () => next())
+      plumbCallsRouted += 1
+      const outcome = await als.run(ident, async () => next())
+
+      // A plumb call that completed without a single stamp means the transport
+      // patch is NOT on the request path of the client dsh-mcp-client actually
+      // uses. The usual cause is a package split: dsh-mcp-client stopped
+      // importing `@modelcontextprotocol/sdk` and moved to another
+      // @modelcontextprotocol package, or to a new major of it, so the class
+      // patched above is never instantiated. Nothing else here can see that —
+      // the import succeeded, the patch installed, and the calls simply travel
+      // without identity. Reported once per apply, because it is a property of
+      // the install rather than of the call.
+      if (stampsApplied === 0 && !unstampedReported) {
+        unstampedReported = true
+        ctx.logger?.warn?.(`${name}: routed ${plumbCallsRouted} plumb call(s) with nothing stamped — the MCP client patch at ${sdkSource} is not on the running client's request path, so plumb cannot attribute these calls and refuses the state-changing ones. Check that dsh-mcp-client imports the same @modelcontextprotocol package (and major) this plugin patched.`)
+      }
+
+      return outcome
     } catch (error) {
       const signature = String(error).slice(0, 120)
       if (!unwrappedErrors.has(signature)) {

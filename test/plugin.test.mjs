@@ -133,6 +133,56 @@ test('wrap stamps _meta inside the identity scope and captures the instance', as
   }
 })
 
+test('a plumb call that travels through the patched client reports no identity fault', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    // Control for the test below: this is a healthy install — the tool body's
+    // request goes through the class the plugin patched — so the warning about
+    // an unreachable patch must stay silent.
+    await wrap({ name: 'mcp__plumb__daemon_info', ...conversation('conv-ok', '/w/ok') }, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'daemon_info', arguments: {} } }, { parse: (v) => v })
+      return 'tool-result'
+    })
+    assert.equal(
+      ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('nothing stamped')).length,
+      0,
+      'a stamped call must not be reported as an identity fault'
+    )
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('a plumb call that never reaches the patched client is reported once, naming the patched path', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = { name: 'mcp__plumb__daemon_info', ...conversation('conv-lost', '/w/lost') }
+    // The install this warning exists for: dsh-mcp-client resolves a different
+    // @modelcontextprotocol package — or a different major of it — from the one
+    // patched above, so no request ever passes through the patched class and
+    // `plumbClientRef` is never captured. The plugin cannot see the cause, only
+    // the effect: a plumb call completed and nothing was stamped. Simulated by
+    // a tool body that reaches its transport by some other route.
+    await wrap(exec, async () => 'tool-result')
+    await wrap(exec, async () => 'tool-result')
+
+    const warns = ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('nothing stamped'))
+    assert.equal(warns.length, 1, 'a property of the install is reported once, not once per call')
+    assert.match(warns[0][1], /not on the running client's request path/)
+    assert.match(warns[0][1], /client\/index\.js/, 'names the path it patched, which is the whole diagnosis')
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
 test('second call issues exactly one proactive session_start with the right arguments, unstamped', async () => {
   process.env.DSH_HOME = fixtureDshHome
   requests.length = 0
