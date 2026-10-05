@@ -34,7 +34,7 @@ const FINAL_TEXT = 'done'
 /** Plausible non-zero usage: dsh's token meter reads these fields. */
 const USAGE = { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 }
 
-export const FAKE_MODEL_MODES = ['tool-call', 'text-only', 'subagent']
+export const FAKE_MODEL_MODES = ['tool-call', 'text-only', 'subagent', 'per-agent']
 
 /**
  * Start the fake model on an ephemeral 127.0.0.1 port.
@@ -97,6 +97,7 @@ function route(req, res, body, mode, state, log) {
 
 function respond(res, parsed, mode, state) {
   const decision = decide(parsed, mode, state)
+  if (process.env.FAKE_MODEL_DEBUG) console.log(`  fake-model => ${decision.kind}${decision.name ? ' ' + decision.name : ''} (spawns=${state.spawns})`)
   const model = typeof parsed.model === 'string' ? parsed.model : 'fake-1'
   const wantsUsage = parsed.stream_options?.include_usage === true
   if (parsed.stream === true) {
@@ -117,6 +118,24 @@ function decide(parsed, mode, state) {
   const tools = (Array.isArray(parsed.tools) ? parsed.tools : [])
     .map((entry) => entry?.function ?? (typeof entry?.name === 'string' ? entry : null))
     .filter(Boolean)
+  // per-agent: the MAIN agent calls plumb first, then delegates; the subagent's
+  // own conversation has no tool result yet, so it calls plumb too. Two calling
+  // agents is the point — one connection each.
+  if (mode === 'per-agent') {
+    if (hasToolResult) {
+      if (state.spawns < 1) {
+        const spawn = tools.find((tool) => tool.name === 'subagent' || /\bsubagent\b/i.test(tool.name))
+        if (spawn) {
+          state.spawns += 1
+          return { kind: 'tool', name: spawn.name, args: fillArguments(spawn) }
+        }
+      }
+      return { kind: 'text' }
+    }
+    const first = tools.find((tool) => /daemon_info$/.test(tool.name))
+    if (first) return { kind: 'tool', name: first.name, args: fillArguments(first) }
+    return { kind: 'text' }
+  }
   if (mode === 'subagent' && state.spawns < 1) {
     const spawn = tools.find((tool) => tool.name === 'subagent' || /\bsubagent\b/i.test(tool.name))
     if (spawn) {

@@ -12,8 +12,9 @@ const pluginUrl = new URL('../dsh-plumb-identity.mjs', import.meta.url)
 const fixtureDshHome = join(here, 'fixtures/dshhome')
 const fixtureSdkUrl = new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js', import.meta.url).href
 
-const { name, inject, defaultConfig, resolveAgentContext, mintIdentity, shouldSkip, apply } = await import(pluginUrl)
-const { requests, fixtureState, Client } = await import(fixtureSdkUrl)
+const { name, inject, defaultConfig, resolveAgentContext, mintIdentity, shouldSkip, apply, resolvePlumbCommand, mcpContentText } = await import(pluginUrl)
+const { requests, toolCalls, clients, fixtureState, Client } = await import(fixtureSdkUrl)
+const { spawned, instances } = await import(new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js', import.meta.url).href)
 
 /**
  * Mount the plugin against the fixture SDK. Passing sdkPath routes the
@@ -22,8 +23,26 @@ const { requests, fixtureState, Client } = await import(fixtureSdkUrl)
  * The plugin runs from the repo regardless of where node --test is invoked,
  * so DSH_HOME only has to point at the fixture tree, not resolve absolute
  * paths from this file's location.
+ *
+ * `mount` pins the SHARED-connection path (`perAgentConnection: false`), which
+ * is both the historic behaviour and the live fallback, so its tests keep
+ * pinning the stamping contract. `mountPerAgent` exercises the default path —
+ * one `plumb serve` per agent — against the fixture's stdio transport.
  */
-const mount = (ctx, extra = {}) => apply(ctx, { sdkPath: fixtureSdkUrl, ...extra })
+const mount = (ctx, extra = {}) => apply(ctx, { sdkPath: fixtureSdkUrl, perAgentConnection: false, ...extra })
+const mountPerAgent = (ctx, extra = {}) => apply(ctx, { sdkPath: fixtureSdkUrl, perAgentConnection: true, ...extra })
+
+/** Every fixture-side record the per-agent tests assert on. */
+function resetFixture () {
+  requests.length = 0
+  toolCalls.length = 0
+  spawned.length = 0
+  clients.length = 0
+  instances.length = 0
+  fixtureState.toolResults = {}
+  fixtureState.failToolCall = false
+  fixtureState.listedTools = ['session_start', 'read_file', 'edit_file', 'write_file', 'daemon_info']
+}
 
 test('plugin surface matches the cordis contract', () => {
   assert.equal(name, 'dsh-plumb-identity')
@@ -89,8 +108,25 @@ test('defaultConfig carries the documented defaults', () => {
     detail: 'brief',
     excludeEnv: ['PAUTA_RUN_ID'],
     connectMarker: 'plumb',
-    logEvents: false
+    logEvents: false,
+    perAgentConnection: true,
+    plumbCommand: '',
+    plumbArgs: ['serve'],
+    maxConnections: 16,
+    idleMs: 15_000
   })
+})
+
+test('resolvePlumbCommand prefers config, then $PLUMB_BIN, then PATH', () => {
+  assert.equal(resolvePlumbCommand({ plumbCommand: '/opt/plumb' }, { PLUMB_BIN: '/env/plumb' }), '/opt/plumb')
+  assert.equal(resolvePlumbCommand({ plumbCommand: '' }, { PLUMB_BIN: '/env/plumb' }), '/env/plumb')
+  assert.equal(resolvePlumbCommand({ plumbCommand: '' }, {}), 'plumb')
+})
+
+test('mcpContentText mirrors the bridge: text joined, other blocks named', () => {
+  assert.equal(mcpContentText([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }], 'read_file'), 'a\nb')
+  assert.match(mcpContentText([{ type: 'image', data: 'x' }], 'read_file'), /read_file: image content is not rendered/)
+  assert.equal(mcpContentText(undefined, 'read_file'), '')
 })
 
 // -- the mounted plugin -------------------------------------------------------
@@ -503,3 +539,156 @@ test('two simultaneous first calls from one agent issue one declaration', async 
   }
 })
 
+
+// -- per-agent connections (the default path) --------------------------------
+
+test("a plumb call runs over the agent's OWN connection, never the shared one", async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = {
+      name: 'mcp__plumb__read_file',
+      arguments: { file_path: '/w/own/x.go' },
+      ...conversation('conv-own', '/w/own')
+    }
+    const result = await wrap(exec, async () => {
+      throw new Error('the shared connection must not be used')
+    })
+
+    // One connection, spawned as a plumb proxy inside the agent's workspace.
+    assert.equal(spawned.length, 1, 'exactly one connection for one agent')
+    assert.deepEqual(spawned[0].args, ['serve'])
+    assert.equal(spawned[0].cwd, '/w/own')
+
+    // Declared on that connection, with this agent's minted id and workspace.
+    const declare = toolCalls.find((call) => call.name === 'session_start')
+    assert.equal(declare.arguments.session_id, 'dsh-w-own-conv-own')
+    assert.equal(declare.arguments.workspace, '/w/own')
+
+    // The call itself went over the SAME client instance.
+    const invoked = toolCalls.find((call) => call.name === 'read_file')
+    assert.equal(invoked.clientId, declare.clientId)
+    assert.deepEqual(invoked.arguments, { file_path: '/w/own/x.go' })
+
+    // Canonical value + model-facing content, as @deepseek-ai/dsh-mcp-client builds them.
+    assert.equal(result.isError, false)
+    assert.deepEqual(result.value, { content: [{ type: 'text', text: 'per-agent read_file' }] })
+    assert.deepEqual(result.content, [{ type: 'text', text: 'per-agent read_file' }])
+
+    // And nothing travelled over the shared connection.
+    assert.equal(requests.length, 0)
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('each agent gets its own connection, declared with its own id and purpose', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    await wrap({ name: 'mcp__plumb__read_file', arguments: {}, ...conversation('conv-a', '/w/a') }, async () => 'shared')
+    await wrap({
+      name: 'mcp__plumb__read_file',
+      arguments: {},
+      ...conversation('conv-b', '/w/b', { parentSession: 'conv-a', delegationDepth: 1 })
+    }, async () => 'shared')
+
+    assert.equal(spawned.length, 2, 'one connection per agent, not one per process')
+    assert.deepEqual(spawned.map((s) => s.cwd), ['/w/a', '/w/b'])
+
+    const declared = toolCalls.filter((call) => call.name === 'session_start')
+    assert.deepEqual(declared.map((call) => call.arguments.session_id), ['dsh-w-a-conv-a', 'dsh-w-b-conv-b'])
+    assert.deepEqual(declared.map((call) => call.arguments.purpose), ['dsh', 'dsh-subagent'])
+    assert.notEqual(declared[0].clientId, declared[1].clientId, "a subagent is not declared on its parent's connection")
+    assert.equal(requests.length, 0, 'no agent fell back to the shared connection')
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('concurrent first calls from one agent open one connection together', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = { name: 'mcp__plumb__daemon_info', arguments: {}, ...conversation('conv-race', '/w/r') }
+    await Promise.all([
+      wrap(exec, async () => 'shared'),
+      wrap(exec, async () => 'shared'),
+      wrap(exec, async () => 'shared')
+    ])
+    assert.equal(spawned.length, 1)
+    assert.equal(toolCalls.filter((call) => call.name === 'session_start').length, 1, 'one declaration per agent, not one per call')
+    assert.equal(toolCalls.filter((call) => call.name === 'daemon_info').length, 3)
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('a dispatched call that fails is NOT retried on the shared connection', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  fixtureState.toolResults = {
+    write_file: { isError: true, content: [{ type: 'text', text: 'write_file: refused — the file is dirty' }] }
+  }
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    let sharedRuns = 0
+    await assert.rejects(
+      () => wrap(
+        { name: 'mcp__plumb__write_file', arguments: { file_path: '/w/x' }, ...conversation('conv-err', '/w/e') },
+        async () => { sharedRuns += 1; return 'shared' }
+      ),
+      /refused — the file is dirty/
+    )
+    assert.equal(sharedRuns, 0, 'plumb writes are not idempotent: a sent call must never be re-sent')
+    assert.equal(requests.length, 0)
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test("a tool the agent's connection does not advertise falls back to the shared client", async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  fixtureState.listedTools = ['session_start', 'daemon_info']
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    let sharedRuns = 0
+    const result = await wrap(
+      { name: 'mcp__plumb__read_file', arguments: {}, ...conversation('conv-unk', '/w/u') },
+      async () => { sharedRuns += 1; return 'shared-result' }
+    )
+    assert.equal(result, 'shared-result', 'an unknown name is dispatched before anything is sent')
+    assert.equal(sharedRuns, 1)
+    assert.equal(toolCalls.filter((call) => call.name === 'read_file').length, 0, 'the per-agent connection was never asked')
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('dispose closes every per-agent connection', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  const wrap = ctx.handlers['tools/execute']
+  await wrap({ name: 'mcp__plumb__daemon_info', arguments: {}, ...conversation('conv-close', '/w/c') }, async () => 'shared')
+  assert.equal(instances.length, 1)
+  assert.equal(instances[0].closed, false)
+  await ctx.handlers.dispose?.()
+  assert.equal(instances[0].closed, true, 'the transport is closed on dispose')
+  assert.ok(clients.every((client) => client.closed === true), 'the client is closed on dispose')
+})

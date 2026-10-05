@@ -44,6 +44,41 @@
 // reinstall, or plumb refuses a declaration, the call proceeds unstamped and
 // the AGENTS.md instruction surface remains the fallback. A tool call must
 // never break because its observer could not describe itself.
+//
+// # The stronger fix: one `plumb serve` per agent (`perAgentConnection`)
+//
+// Stamping is mitigation. It makes a SHARED connection attributable, and it
+// depends on plumb's identity layer being present, correct and reached — the
+// chain that silently broke on 2026-10-01 when `dsh-mcp-client` moved to
+// `@modelcontextprotocol/client@2.0.0` and left the patch on a class nothing
+// instantiated. Every other harness on this machine gives each client process
+// its own `plumb serve`; DSH is the outlier because it multiplexes every
+// conversation and in-process subagent over ONE connection per process.
+//
+// DSH's own scope layer is built for the alternative — the MCP client's
+// `apply` "reserves the serverName inside the current registration scope", and
+// "independent Agent scopes may reuse the same namespace because their tools
+// and transports are isolated" — but nothing MOUNTS an MCP server into an
+// Agent scope: a preset's plugins are "eagerly activated once and shared by
+// their selecting Agents". The capability exists; configuration cannot reach
+// it.
+//
+// So this plugin reaches it: for a plumb call from an agent it has a session
+// for, it spawns its OWN `plumb serve` child, declares that agent on it, and
+// dispatches the call over that connection instead of the shared one. The
+// connection IS the identity — no `_meta` stamping, no shared-connection gate,
+// no pin collisions, no cross-agent writes, and nothing to keep in sync with
+// plumb's identity internals.
+//
+// Two rules keep it strictly better than the shared path:
+//
+//   * It only ever falls back BEFORE dispatch — an unreachable per-agent
+//     connection, or a tool name the per-agent server does not list, hands the
+//     call to the shared client exactly as before. A call that has been sent is
+//     never retried on another connection, because plumb's writes are not
+//     idempotent and a "retry" could apply them twice.
+//   * The shared connection keeps doing what it is good at: tool discovery
+//     (the model-facing schemas) and resource reads. Only EXECUTION moves.
 
 import { homedir } from 'node:os'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -51,8 +86,28 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 /** Stable cordis plugin name (loader diagnostics, HMR swap, patch overrides). */
 export const name = 'dsh-plumb-identity'
 
+/** Reported to plumb in the MCP client handshake; informational only. */
+let pluginVersion = '0.0.0'
+try {
+  const pkg = await import(new URL('./package.json', import.meta.url).href, { with: { type: 'json' } })
+  pluginVersion = pkg.default?.version ?? pluginVersion
+} catch {
+  // The version is informational; a package.json that cannot be read must not
+  // stop the plugin from loading.
+}
+
 /** The tools service is the only thing this plugin touches on the context. */
 export const inject = ['tools']
+
+/**
+ * Diagnostic channel for the per-agent connection lifecycle, off unless
+ * `PLUMB_IDENTITY_DEBUG` is set. It writes to stderr rather than the plugin
+ * logger because the interesting failures happen before a call can be
+ * attributed to an agent, and a host that swallows info logs would hide them.
+ */
+function debug (...args) {
+  if (process.env.PLUMB_IDENTITY_DEBUG) console.error('[dsh-plumb-identity]', ...args)
+}
 
 /** plumb's per-call identity key, from plumb's internal/mcp/meta_keys.go. */
 export const identityMetaKey = 'dev.plumbkit/logical-agent'
@@ -74,8 +129,71 @@ export function defaultConfig () {
     detail: 'brief',
     excludeEnv: ['PAUTA_RUN_ID'],
     connectMarker: 'plumb',
-    logEvents: false
+    logEvents: false,
+    // Give each agent its own `plumb serve` and dispatch its plumb calls over
+    // it. Set false to return to stamping identity onto the shared connection,
+    // which is what this plugin did before per-agent connections existed.
+    perAgentConnection: true,
+    // Empty means: $PLUMB_BIN, else `plumb` on PATH. Set it when the binary is
+    // somewhere neither reaches.
+    plumbCommand: '',
+    plumbArgs: ['serve'],
+    // Bounded so a long-lived process cannot accumulate transports without
+    // limit. The least recently used connection is closed when it is exceeded.
+    maxConnections: 16,
+    // Close a connection after this long with no call on it (0 keeps it for the
+    // life of the process). A plugin inside someone else's host must not hold
+    // resources the host cannot reclaim: DSH's headless path never disposes
+    // plugins, so a connection that is merely idle outlives the run and the
+    // process then never exits. Reconnecting is cheap and self-healing —
+    // `connectionFor` re-declares the agent and its workspace on every connect
+    // — so an idle close costs one spawn, not correctness.
+    idleMs: 15_000
   }
+}
+
+/**
+ * The command that starts a per-agent plumb proxy: an explicit config value
+ * wins, then $PLUMB_BIN (what the e2e harness sets), then PATH.
+ */
+export function resolvePlumbCommand (config, env) {
+  const configured = config?.plumbCommand
+  if (typeof configured === 'string' && configured.length > 0) return configured
+  const fromEnv = env?.PLUMB_BIN
+  if (typeof fromEnv === 'string' && fromEnv.length > 0) return fromEnv
+  return 'plumb'
+}
+
+/**
+ * The child environment for a per-agent proxy: the ambient one, minus entries
+ * with no value. plumb is a local trusted binary and needs what a normal shell
+ * gives it (PATH to resolve itself, HOME/XDG for its daemon state), so unlike a
+ * remote MCP server this is a pass-through rather than a scrub.
+ */
+export function childEnv (env) {
+  const out = {}
+  for (const [key, value] of Object.entries(env ?? {})) {
+    if (typeof value === 'string') out[key] = value
+  }
+  return out
+}
+
+/**
+ * Project MCP result content into the model-facing text the bridge would
+ * render. Mirrors `extractText` in `@deepseek-ai/dsh-mcp-client`: text runs are
+ * joined by newlines, and a block that is not text contributes a one-line
+ * diagnostic rather than disappearing.
+ */
+export function mcpContentText (content, toolName) {
+  const blocks = Array.isArray(content) ? content : []
+  const text = blocks
+    .map((block) => {
+      if (block?.type === 'text' && typeof block.text === 'string') return block.text
+      const kind = typeof block?.type === 'string' ? block.type : 'unknown'
+      return `[${toolName}: ${kind} content is not rendered as text]`
+    })
+    .filter((part) => part.length > 0)
+  return text.join('\n')
 }
 
 /**
@@ -146,6 +264,7 @@ function defaultSdkRoot () {
 }
 
 const moduleSdk = await import(`${defaultSdkRoot()}/client/index.js`).catch(() => null)
+const moduleTransport = await import(`${defaultSdkRoot()}/client/stdio.js`).catch(() => null)
 const moduleSchema = await import(`${defaultSdkRoot()}/types.js`)
   .then((m) => m.CallToolResultSchema ?? null)
   .catch(() => null)
@@ -200,6 +319,9 @@ export async function apply (ctx, config) {
   const sdk = config?.sdkPath
     ? await import(config.sdkPath).catch(() => null)
     : moduleSdk
+  const transportModule = config?.sdkPath
+    ? await import(new URL('./stdio.js', config.sdkPath).href).catch(() => null)
+    : moduleTransport
   const resultSchema = config?.sdkPath
     ? null
     : moduleSchema
@@ -377,65 +499,325 @@ export async function apply (ctx, config) {
     return pending
   }
 
+  // -- Per-agent connections ------------------------------------------------
+  //
+  // One `plumb serve` child per agent, opened lazily on that agent's first
+  // plumb call and declared on the spot, then reused for the life of the
+  // process. Keyed by DSH session id, which is what identifies a conversation
+  // or an in-process subagent.
+  //
+  // This is the structural fix: the connection carries the identity, so there
+  // is nothing to stamp onto a shared one and no way for two agents to be
+  // confused for each other.
+
+  const connections = new Map() // sessionId -> { promise, client, transport, toolNames, lastUsed }
+  const connectionFaults = new Set()
+  let connectionsClosed = false
+  let capabilityNoted = false
+
+  /**
+   * The stdio transport and client classes this mode needs, or null when the
+   * SDK they live in could not be imported. That is a capability gap rather
+   * than a fault — the plugin simply stays on the shared connection — so it is
+   * noted once at info level and never as a warning.
+   */
+  function perAgentClasses () {
+    const Transport = transportModule?.StdioClientTransport
+    if (Transport === undefined || Transport === null) return null
+    if (sdk?.Client === undefined || sdk.Client === null) return null
+    return { Transport, Client: sdk.Client }
+  }
+
+  function noteCapabilityGap () {
+    if (capabilityNoted) return
+    capabilityNoted = true
+    ctx.logger?.info?.(`${name}: per-agent connections unavailable (MCP client/stdio transport not importable); plumb calls use the shared connection`)
+  }
+
+  function closeEntry (entry) {
+    // Best effort: a failing close must not mask whatever prompted it.
+    if (entry?.idleTimer !== undefined) clearTimeout(entry.idleTimer)
+    entry.idleTimer = undefined
+    try { entry?.client?.close?.() } catch { /* teardown */ }
+    try { entry?.transport?.close?.() } catch { /* teardown */ }
+  }
+
+  /**
+   * Mark a connection as just used and arm its idle close. The timer is
+   * unref'd, so it can never be the reason the host process stays alive — that
+   * would defeat its purpose.
+   */
+  function touch (key, entry) {
+    entry.lastUsed = Date.now()
+    if (!(cfg.idleMs > 0)) return
+    if (entry.idleTimer !== undefined) clearTimeout(entry.idleTimer)
+    entry.idleTimer = setTimeout(() => {
+      if (connections.get(key) !== entry) return
+      connections.delete(key)
+      closeEntry(entry)
+      debug('idle-close', key)
+    }, cfg.idleMs)
+    entry.idleTimer.unref?.()
+  }
+
+  /** Keep the registry bounded; close the least recently used excess. */
+  function evictConnections () {
+    if (connections.size <= cfg.maxConnections) return
+    const candidates = [...connections.entries()]
+      .filter(([, entry]) => entry.client !== undefined)
+      .sort((a, b) => (a[1].lastUsed ?? 0) - (b[1].lastUsed ?? 0))
+    while (connections.size > cfg.maxConnections && candidates.length > 0) {
+      const [key, entry] = candidates.shift()
+      connections.delete(key)
+      closeEntry(entry)
+      if (cfg.logEvents) ctx.logger?.info?.(`${name}: closed the least recently used plumb connection (${key})`)
+    }
+  }
+
+  /** Report a connection fault once per distinct signature, not once per call. */
+  function noteConnectionFault (key, error) {
+    const signature = `${key}: ${String(error).slice(0, 120)}`
+    if (connectionFaults.has(signature)) return
+    connectionFaults.add(signature)
+    ctx.logger?.warn?.(`${name}: no per-agent plumb connection for ${key} (${signature}); this call uses the shared one`)
+  }
+
+  /**
+   * The agent's own plumb connection, opened on first use and shared by that
+   * agent's concurrent calls. Rejects when it cannot be opened at all — the
+   * caller then falls back to the shared connection, BEFORE anything is sent.
+   */
+  function connectionFor (agentContext, ident, classes) {
+    const key = agentContext.sessionId
+    const existing = connections.get(key)
+    if (existing !== undefined) return existing.promise
+
+    const entry = { lastUsed: Date.now() }
+    entry.promise = (async () => {
+      if (classes === null || classes === undefined) throw new Error('per-agent connection classes are unavailable')
+      debug('connecting', key, 'cwd=' + agentContext.workspace, 'command=' + resolvePlumbCommand(cfg, process.env))
+      const { Transport, Client } = classes
+
+      const transport = new Transport({
+        command: resolvePlumbCommand(cfg, process.env),
+        args: cfg.plumbArgs,
+        cwd: agentContext.workspace,
+        env: childEnv(process.env),
+        // Deliberately NOT the SDK default. Unset `stderr` means 'inherit', and
+        // an inherited stderr is a descriptor the HOST's own parent may be
+        // waiting to drain: a run that finished cleanly then looks like a hang,
+        // because this child outlives the turn that started it. Piped here (and
+        // drained below) so the child can never hold a descriptor the host
+        // cares about, while its output stays available when events are logged.
+        stderr: 'pipe'
+      })
+      // Drain unconditionally: an unread pipe would apply backpressure to the
+      // child and eventually stall it.
+      transport.stderr?.on?.('data', (chunk) => {
+        if (cfg.logEvents) ctx.logger?.info?.(`${name}: ${String(chunk).trimEnd()}`)
+      })
+      const client = new Client({ name, version: pluginVersion }, { capabilities: {} })
+      await client.connect(transport)
+      debug('connected', key)
+      entry.transport = transport
+      entry.client = client
+
+      // What THIS connection advertises. The routing guard refuses to send a
+      // name it does not list, so a schema change on the shared connection can
+      // never be dispatched into a connection that cannot serve it.
+      const listed = await client.listTools?.({})
+      entry.toolNames = new Set((listed?.tools ?? []).map((tool) => tool.name))
+      debug('advertised', key, entry.toolNames.size + ' tools')
+
+      // Declare this agent ON ITS OWN CONNECTION. Nothing else shares it, so
+      // the id and the workspace pin cannot land on another agent's shard.
+      const args = {
+        session_id: ident.id,
+        workspace: ident.workspace,
+        purpose: agentContext.isSubagent ? cfg.subagentPurpose : cfg.purpose,
+        detail: cfg.detail
+      }
+      try {
+        await client.callTool({ name: 'session_start', arguments: args }, resultSchema ?? undefined)
+      } catch (error) {
+        // Not fatal: the connection is still this agent's own, so the worst
+        // case is an undeclared shard, which the AGENTS.md surface covers.
+        ctx.logger?.warn?.(`${name}: session_start on ${ident.id}'s own connection failed (${String(error).slice(0, 120)}); the connection is still private to this agent`)
+      }
+
+      touch(key, entry)
+      debug('declared', ident.id)
+      if (cfg.logEvents) ctx.logger?.info?.(`${name}: opened a plumb connection for ${ident.id} (${entry.toolNames.size} tools)`)
+      return entry
+    })()
+
+    connections.set(key, entry)
+    evictConnections()
+    // Drop a failed attempt so the agent's next call can retry it.
+    entry.promise.catch(() => { connections.delete(key) })
+    return entry.promise
+  }
+
+  /**
+   * Dispatch one plumb call over the agent's own connection.
+   *
+   * Returns the normalized result for the waterfall, or null to fall back to
+   * the shared client. The fallback happens ONLY before dispatch — no
+   * connection, or a tool name this server does not advertise. A call that has
+   * already been sent is never re-sent elsewhere: plumb's writes are not
+   * idempotent, so a retry could apply one twice. That is why an error from the
+   * call itself propagates instead of falling back.
+   */
+  async function routeOverOwnConnection (exec, toolName, agentContext, ident) {
+    const classes = perAgentClasses()
+    if (classes === null) {
+      noteCapabilityGap()
+      return null
+    }
+
+    const rawName = toolName.slice(prefix.length)
+    debug('route', rawName, 'agent=' + agentContext.sessionId)
+    let entry
+    try {
+      entry = await connectionFor(agentContext, ident, classes)
+    } catch (error) {
+      debug('route: connection failed', rawName, String(error))
+      noteConnectionFault(agentContext.sessionId, error)
+      return null
+    }
+    if (!entry.toolNames.has(rawName)) {
+      if (cfg.logEvents) ctx.logger?.info?.(`${name}: ${rawName} is not advertised by the per-agent connection; using the shared one`)
+      return null
+    }
+
+    touch(agentContext.sessionId, entry)
+    debug('dispatch', rawName, 'over client for', agentContext.sessionId)
+    const call = await entry.client.callTool(
+      { name: rawName, arguments: exec.arguments ?? {} },
+      resultSchema ?? undefined,
+      exec.signal === undefined ? undefined : { signal: exec.signal }
+    )
+
+    debug('dispatched', rawName)
+    const content = Array.isArray(call?.content) ? call.content : []
+    if (call?.isError === true) throw new Error(mcpContentText(content, rawName))
+    // The bridge's canonical success value, so downstream consumers (retention,
+    // PTC callers) see the same shape they would from the shared connection.
+    const value = {
+      content,
+      ...(call?.structuredContent !== undefined ? { structuredContent: call.structuredContent } : {})
+    }
+    return { isError: false, value, content: [{ type: 'text', text: mcpContentText(content, rawName) }] }
+  }
+
   // -- Tool waterfall -------------------------------------------------------
   const unwrappedErrors = new Set()
-  ctx.on('tools/execute', async (exec, next) => {
-    const toolName = exec?.name
-    if (typeof toolName !== 'string' || !toolName.startsWith(prefix)) return next()
-    try {
-      const agentContext = resolveAgentContext(exec)
-      if (agentContext === null) {
-        if (!unwrappedErrors.has('no-agent')) {
-          unwrappedErrors.add('no-agent')
-          ctx.logger?.warn?.(`${name}: ${toolName} has no DSH session on exec.agent; passing through unstamped`)
-        }
-        return next()
+
+  /** Warn once per distinct pre-dispatch failure, never once per call. */
+  function noteUnwrapped (error) {
+    const signature = String(error).slice(0, 120)
+    if (unwrappedErrors.has(signature)) return
+    unwrappedErrors.add(signature)
+    ctx.logger?.warn?.(`${name}: identity wrap failed, passing through unstamped: ${signature}`)
+  }
+
+  /**
+   * Resolve the caller and its identity, or null when the caller carries no DSH
+   * session (the call then passes through untouched, reported once).
+   */
+  function prepareCall (exec, toolName) {
+    const agentContext = resolveAgentContext(exec)
+    if (agentContext === null) {
+      if (!unwrappedErrors.has('no-agent')) {
+        unwrappedErrors.add('no-agent')
+        ctx.logger?.warn?.(`${name}: ${toolName} has no DSH session on exec.agent; passing through unstamped`)
       }
-      const ident = {
+      return null
+    }
+    return {
+      agentContext,
+      ident: {
         id: mintIdentity({ prefix: cfg.idPrefix, workspace: agentContext.workspace, sessionId: agentContext.sessionId }),
         workspace: agentContext.workspace
       }
+    }
+  }
 
-      // Proactive declaration, deliberately OUTSIDE the identity scope: this
-      // request must go out unstamped so plumb reads the id from the
-      // arguments — the channel its linkage, workspace pin, and orientation
-      // packet are built around. Keyed per Client instance because dsh-mcp-client
-      // builds a fresh Client on every reconnect generation; a new connection
-      // knows no identities and each must re-declare on it.
-      const client = plumbClientRef?.deref()
-      if (client !== undefined) {
-        await declarationFor(client, agentContext, ident, resultSchema)
-      }
+  ctx.on('tools/execute', async (exec, next) => {
+    const toolName = exec?.name
+    if (typeof toolName !== 'string' || !toolName.startsWith(prefix)) return next()
 
-      plumbCallsRouted += 1
-      const outcome = await als.run(ident, async () => next())
-
-      // A plumb call that completed without a single stamp means the transport
-      // patch is NOT on the request path of the client dsh-mcp-client actually
-      // uses. The usual cause is a package split: dsh-mcp-client stopped
-      // importing `@modelcontextprotocol/sdk` and moved to another
-      // @modelcontextprotocol package, or to a new major of it, so the class
-      // patched above is never instantiated. Nothing else here can see that —
-      // the import succeeded, the patch installed, and the calls simply travel
-      // without identity. Reported once per apply, because it is a property of
-      // the install rather than of the call.
-      if (stampsApplied === 0 && !unstampedReported) {
-        unstampedReported = true
-        ctx.logger?.warn?.(`${name}: routed ${plumbCallsRouted} plumb call(s) with nothing stamped — the MCP client patch at ${sdkSource} is not on the running client's request path, so plumb cannot attribute these calls and refuses the state-changing ones. Check that dsh-mcp-client imports the same @modelcontextprotocol package (and major) this plugin patched.`)
-      }
-
-      return outcome
+    // Only the PRE-DISPATCH phase is guarded. Everything it can fail at —
+    // resolving the caller, minting the identity — leaves the call unsent, so
+    // falling back to the shared client is safe and is what it did before this
+    // mode existed.
+    //
+    // Dispatch is deliberately NOT guarded: once a call has been sent, an error
+    // must reach the harness rather than be retried on the other connection,
+    // because plumb's writes are not idempotent and a "fallback" would be a
+    // second execution of the same mutation.
+    let prepared
+    try {
+      prepared = prepareCall(exec, toolName)
     } catch (error) {
-      const signature = String(error).slice(0, 120)
-      if (!unwrappedErrors.has(signature)) {
-        unwrappedErrors.add(signature)
-        ctx.logger?.warn?.(`${name}: identity wrap failed, passing through unstamped: ${signature}`)
-      }
+      noteUnwrapped(error)
       return next()
     }
+    if (prepared === null) return next()
+    const { agentContext, ident } = prepared
+
+    // Prefer the agent's OWN connection: the connection is the identity, so
+    // nothing has to be stamped onto a shared one. Falls back before dispatch,
+    // never after — routeOverOwnConnection returns null only when it has sent
+    // nothing.
+    if (cfg.perAgentConnection === true && !connectionsClosed) {
+      const routed = await routeOverOwnConnection(exec, toolName, agentContext, ident)
+      if (routed !== null) return routed
+    }
+
+    // -- Shared-connection fallback (the pre-per-agent behaviour) -------------
+    //
+    // Proactive declaration, deliberately OUTSIDE the identity scope: this
+    // request must go out unstamped so plumb reads the id from the arguments —
+    // the channel its linkage, workspace pin, and orientation packet are built
+    // around. Keyed per Client instance because dsh-mcp-client builds a fresh
+    // Client on every reconnect generation; a new connection knows no
+    // identities and each must re-declare on it.
+    const client = plumbClientRef?.deref()
+    if (client !== undefined) {
+      try {
+        await declarationFor(client, agentContext, ident, resultSchema)
+      } catch (error) {
+        // Advisory: the call itself still proceeds, exactly once.
+        noteUnwrapped(error)
+      }
+    }
+
+    plumbCallsRouted += 1
+    const outcome = await als.run(ident, async () => next())
+
+    // A plumb call that completed without a single stamp means the transport
+    // patch is NOT on the request path of the client dsh-mcp-client actually
+    // uses. The usual cause is a package split: dsh-mcp-client stopped
+    // importing `@modelcontextprotocol/sdk` and moved to another
+    // @modelcontextprotocol package, or to a new major of it, so the class
+    // patched above is never instantiated. Nothing else here can see that —
+    // the import succeeded, the patch installed, and the calls simply travel
+    // without identity. Reported once per apply, because it is a property of
+    // the install rather than of the call.
+    if (stampsApplied === 0 && !unstampedReported) {
+      unstampedReported = true
+      ctx.logger?.warn?.(`${name}: routed ${plumbCallsRouted} plumb call(s) with nothing stamped — the MCP client patch at ${sdkSource} is not on the running client's request path, so plumb cannot attribute these calls and refuses the state-changing ones. Check that dsh-mcp-client imports the same @modelcontextprotocol package (and major) this plugin patched.`)
+    }
+
+    return outcome
   })
 
   ctx.on('dispose', () => {
+    debug('dispose: closing', connections.size, 'per-agent connection(s)')
+    connectionsClosed = true
+    for (const entry of connections.values()) closeEntry(entry)
+    connections.clear()
     restorePatch?.()
   })
 }

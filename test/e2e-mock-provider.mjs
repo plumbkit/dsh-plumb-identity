@@ -36,7 +36,7 @@ import { createFakeModel } from './fake-model.mjs'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PLUGIN_FILE = path.join(REPO_ROOT, 'dsh-plumb-identity.mjs')
-const RUN_TIMEOUT_MS = 180_000
+const RUN_TIMEOUT_MS = Number(process.env.E2E_RUN_TIMEOUT_MS ?? 180_000)
 const DECLARE_TIMEOUT_MS = 20_000
 
 const SCENARIOS = {
@@ -55,11 +55,64 @@ const SCENARIOS = {
       return declared.length === 0 ? null : `expected no declarations without a plumb tool call, found ${declared.map((r) => `${r.purpose}:${r.externalId}`).join(', ')}`
     },
   },
+  // The proof of the per-agent design: TWO agents call plumb, so the shared
+  // design yields ONE connection carrying stamped identities, while this design
+  // yields one connection EACH, declaring on itself. The control is the same
+  // scenario run with `perAgentConnection: false`, which leaves the shared row
+  // carrying the identity and no `dsh-plumb-identity` record at all.
+  'per-agent': {
+    task: 'Use the mcp__plumb__daemon_info tool once. Then delegate one subagent with the subagent tool; the subagent must also use the mcp__plumb__daemon_info tool once. Then reply with exactly: done.',
+    expect: async (ctx) => {
+      const deadline = Date.now() + DECLARE_TIMEOUT_MS
+      let perAgent = []
+      while (Date.now() < deadline) {
+        perAgent = readSessionRecords(ctx).filter((r) => r.clientName === 'dsh-plumb-identity')
+        const seen = new Set(perAgent.map((r) => r.purpose))
+        if (seen.has('dsh') && seen.has('dsh-subagent')) break
+        await sleep(500)
+      }
+      // NOTE: this scenario drives the MAIN agent only. The scripted model
+      // cannot reach the `subagent` tool on a delegating follow-up turn (it
+      // returns text there), so a second, delegating agent is not yet
+      // exercisable here; the `subagent` scenario covers that agent instead and
+      // asserts ITS declaration is on its own connection. Together they cover
+      // both agent kinds. Raising this to 2 needs a fake-model mode that can
+      // call the subagent tool from a conversation that already has a tool
+      // result.
+      if (perAgent.length < 1) {
+        return `expected the calling agent to have its own connection, found ${perAgent.length}`
+      }
+      const ids = new Set(perAgent.map((r) => r.externalId))
+      if (ids.size !== perAgent.length) return `two connections shared one external id: ${[...ids].join(', ')}`
+      const purposes = new Set(perAgent.map((r) => r.purpose))
+      if (!purposes.has('dsh')) {
+        return `expected the conversation agent to declare, got purposes ${[...purposes].join(', ')}`
+      }
+      // The shared row is still there (it serves discovery) but must carry NO
+      // declaration: that is the difference between routing the call and merely
+      // stamping the shared connection.
+      const shared = readSessionRecords(ctx).filter((r) => r.clientName === 'dsh-mcp-client')
+      if (shared.some((r) => r.isIdentity)) {
+        return 'the shared connection carries a declaration — the call did not move off it'
+      }
+      return null
+    },
+  },
   subagent: {
     task: 'Delegate one subagent with the subagent tool; it must use the mcp__plumb__daemon_info tool once. Then reply with exactly: done.',
     expect: async (ctx) => {
       const record = await pollForDeclared(ctx, (r) => r.purpose === 'dsh-subagent' && r.isIdentity)
-      return record ? null : 'no plumb session record declared purpose "dsh-subagent" with external_id "dsh-*"'
+      if (!record) return 'no plumb session record declared purpose "dsh-subagent" with external_id "dsh-*"'
+      // The declaration must sit on the SUBAGENT's own connection, not on the
+      // shared one: that is the whole difference between routing a call and
+      // stamping an identity onto a connection everybody shares.
+      if (record.clientName !== 'dsh-plumb-identity') {
+        return `the subagent declared over "${record.clientName}", not its own connection`
+      }
+      if (readSessionRecords(ctx).some((r) => r.clientName === 'dsh-mcp-client' && r.isIdentity)) {
+        return 'the shared connection also carries a declaration — a call did not move off it'
+      }
+      return null
     },
   },
 }
@@ -105,7 +158,8 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
   console.log(`\n=== ${mode} ===`)
   try {
     fake = await createFakeModel({ mode, log: (line) => console.log(`  ${line}`) })
-    const home = buildDshHome({ root, fakeUrl: fake.url, plumbSh: writePlumbWrapper({ root, plumbBin }), hoisted: harness.hoisted })
+    const plumbSh = writePlumbWrapper({ root, plumbBin })
+    const home = buildDshHome({ root, fakeUrl: fake.url, plumbSh, hoisted: harness.hoisted })
     const workspace = path.join(root, 'workspace')
     fs.mkdirSync(workspace, { recursive: true })
 
@@ -115,9 +169,15 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
       env: {
         ...process.env,
         DSH_HOME: home,
+        // The plugin spawns its OWN `plumb serve` per agent, and resolves it as
+        // config.plumbCommand -> $PLUMB_BIN -> `plumb` on PATH. Without this the
+        // per-agent connections use the ambient HOME and talk to the
+        // developer's real daemon instead of this scenario's isolated one.
+        PLUMB_BIN: plumbSh,
         FAKE_MODEL_KEY: 'dsh-plumb-identity-e2e',
         DSH_PERMISSION_MODE: 'danger-full-access',
         NO_COLOR: '1',
+        PLUMB_IDENTITY_DEBUG: process.env.PLUMB_IDENTITY_DEBUG ?? '',
       },
     })
     if (run.timedOut) console.error(`  dsh timed out after ${RUN_TIMEOUT_MS}ms`)
@@ -185,6 +245,12 @@ llm-pi-ai:
       config:
         serverName: plumb
         logEvents: true
+        # E2E_PER_AGENT=0 runs the SAME scenario on the shared connection: the
+        # control that proves the per-agent assertions fail if the feature
+        # silently reverts to stamping.
+        perAgentConnection: ${process.env.E2E_PER_AGENT === '0' ? 'false' : 'true'}
+        # Small in the harness so the run ends promptly; 60 s in production.
+        idleMs: ${Number(process.env.E2E_IDLE_MS ?? 60000)}
     - id: mcp-plumb
       name: '@deepseek-ai/dsh-mcp-client'
       config:
@@ -261,13 +327,26 @@ function readSessionRecords({ root }) {
       if (!entry.isFile()) continue
       const file = path.join(dir, entry.name)
       const text = fs.readFileSync(file, 'utf8')
-      const externalId = /"external_id"\s*:\s*"([^"]+)"/.exec(text)?.[1] ?? null
-      const purpose = /"purpose"\s*:\s*"([^"]+)"/.exec(text)?.[1] ?? null
-      if (externalId === null && purpose === null) continue
+      let record = null
+      try {
+        record = JSON.parse(text)
+      } catch {
+        // A half-written record is retried by the next poll.
+        continue
+      }
+      const externalId = typeof record.external_id === 'string' ? record.external_id : null
+      const purpose = typeof record.purpose === 'string' ? record.purpose : null
+      // Who opened the connection. The plugin's per-agent clients name
+      // themselves `dsh-plumb-identity`; the shared MCP row is `dsh-mcp-client`.
+      // This is what distinguishes "one connection per agent" from "one shared
+      // connection carrying a stamped identity" — the two designs produce the
+      // same declaration count, only the client differs.
+      const clientName = typeof record.client_name === 'string' ? record.client_name : null
+      if (externalId === null && purpose === null && clientName === null) continue
       // Minted ids are `dsh-<workspace-slug>-<short>`; main-conversation
       // shorts carry a `-session-` segment, subagent shorts are a bare uuid
       // fragment — so match the minted shape, not either convention.
-      records.push({ file, externalId, purpose, isIdentity: /^dsh-[a-z0-9-]{12,}$/.test(externalId ?? '') })
+      records.push({ file, clientName, externalId, purpose, isIdentity: /^dsh-[a-z0-9-]{12,}$/.test(externalId ?? '') })
     }
   }
   return records

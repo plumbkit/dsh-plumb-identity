@@ -121,6 +121,27 @@ Three scenarios, each asserting on plumb's own session records:
 
 Requirements: a `dsh` install (resolved from `$DSH_BIN`, else the `$DSH_HOME` / `~/.dsh` profile tree, exactly what dsh itself resolves) and a plumb binary (`$PLUMB_BIN`, else `../plumb/plumb` beside this checkout, else `plumb` on PATH). Run one scenario with `node test/e2e-mock-provider.mjs --mode subagent`; keep the temp dirs for debugging with `--keep` or `E2E_KEEP=1`.
 
+## Per-agent connections (default)
+
+The plugin no longer only stamps identity onto the connection DSH shares between
+agents: for each agent it opens its **own** `plumb serve`, declares that agent on
+it, and dispatches the agent's `mcp__plumb__*` calls over it. The connection
+carries the identity, so nothing needs stamping and two agents cannot be
+confused for each other.
+
+- The shared connection stays for tool discovery and resource reads; only
+  execution moves.
+- It falls back to the shared path only BEFORE a call is dispatched (no
+  connection could be opened, or the per-agent server does not advertise that
+  name). A call that has been sent is never re-sent elsewhere — plumb's writes
+  are not idempotent, so a "retry" could apply one twice.
+- `perAgentConnection: false` restores the stamping-only behaviour.
+- `plumbCommand`, else `$PLUMB_BIN`, else `plumb` on PATH selects the binary.
+- `idleMs` (default 15 s) closes a connection that has gone unused. It is also
+  the only teardown DSH performs: its headless path never disposes plugins, so
+  without an idle close the host process outlives the run that finished.
+- `PLUMB_IDENTITY_DEBUG=1` traces the connection lifecycle to stderr.
+
 ## Interplay notes
 
 - A model that follows `~/.dsh/AGENTS.md` and calls `session_start` with its own id changes nothing: the per-call `_meta` stamp wins plumb's identity resolution, so the conversation stays under its minted id. Keep the AGENTS.md rules — they are the fallback when the plugin is absent and the path through which the model receives plumb's orientation packet.
