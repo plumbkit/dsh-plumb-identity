@@ -114,7 +114,9 @@ function respond(res, parsed, mode, state) {
 function decide(parsed, mode, state) {
   const messages = Array.isArray(parsed.messages) ? parsed.messages : []
   const hasToolResult = messages.some((message) => message.role === 'tool')
-  if (mode === 'text-only' || hasToolResult) return { kind: 'text' }
+  // `per-agent` decides on BOTH request shapes — the opening turn calls plumb,
+  // the follow-up delegates — so it must not be short-circuited here.
+  if (mode === 'text-only' || (hasToolResult && mode !== 'per-agent')) return { kind: 'text' }
   const tools = (Array.isArray(parsed.tools) ? parsed.tools : [])
     .map((entry) => entry?.function ?? (typeof entry?.name === 'string' ? entry : null))
     .filter(Boolean)

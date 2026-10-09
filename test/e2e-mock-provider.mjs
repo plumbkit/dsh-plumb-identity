@@ -71,22 +71,14 @@ const SCENARIOS = {
         if (seen.has('dsh') && seen.has('dsh-subagent')) break
         await sleep(500)
       }
-      // NOTE: this scenario drives the MAIN agent only. The scripted model
-      // cannot reach the `subagent` tool on a delegating follow-up turn (it
-      // returns text there), so a second, delegating agent is not yet
-      // exercisable here; the `subagent` scenario covers that agent instead and
-      // asserts ITS declaration is on its own connection. Together they cover
-      // both agent kinds. Raising this to 2 needs a fake-model mode that can
-      // call the subagent tool from a conversation that already has a tool
-      // result.
-      if (perAgent.length < 1) {
-        return `expected the calling agent to have its own connection, found ${perAgent.length}`
+      if (perAgent.length < 2) {
+        return `expected one connection per calling agent (2), found ${perAgent.length}: ${perAgent.map((r) => `${r.clientName}/${r.purpose}`).join(', ') || 'none'}`
       }
       const ids = new Set(perAgent.map((r) => r.externalId))
-      if (ids.size !== perAgent.length) return `two connections shared one external id: ${[...ids].join(', ')}`
+      if (ids.size !== perAgent.length) return `two agents shared one external id: ${[...ids].join(', ')}`
       const purposes = new Set(perAgent.map((r) => r.purpose))
-      if (!purposes.has('dsh')) {
-        return `expected the conversation agent to declare, got purposes ${[...purposes].join(', ')}`
+      if (!purposes.has('dsh') || !purposes.has('dsh-subagent')) {
+        return `expected the conversation and the subagent to declare, got purposes ${[...purposes].join(', ')}`
       }
       // The shared row is still there (it serves discovery) but must carry NO
       // declaration: that is the difference between routing the call and merely
