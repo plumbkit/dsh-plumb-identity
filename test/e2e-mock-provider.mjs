@@ -19,7 +19,7 @@
 //     user state. Assertions read plumb's own session records, never the mock.
 //
 // Usage:
-//   npm run test:e2e                       all three scenarios
+//   npm run test:e2e                       every scenario
 //   node test/e2e-mock-provider.mjs --mode tool-call [--mode subagent]
 //   --keep / E2E_KEEP=1                    keep temp roots for debugging
 //
@@ -107,6 +107,32 @@ const SCENARIOS = {
       return null
     },
   },
+  // PLAN-500. A note is waiting for whoever attaches next BEFORE the agent's
+  // first plumb call. That call makes the plugin declare the agent with an
+  // AUTOMATIC session_start, whose packet the model never sees. If that
+  // session_start claims mail (plumb's default), the note is consumed there
+  // and check_messages returns nothing. With `mail: 'preview'` it is still
+  // waiting, and the model receives it from check_messages, exactly once.
+  // Control: delete the plugin's `mail: 'preview'` and this scenario fails.
+  // (A note sent WHILE the agent is connected is a different defect, PLAN-463,
+  // and is deliberately not tested here.)
+  mail: {
+    task: 'Use the mcp__plumb__daemon_info tool once, then the mcp__plumb__check_messages tool once, then reply with exactly: done',
+    setup: fileWaitingNote,
+    expect: async ({ fake, setup }) => {
+      const results = fake.toolResults
+      if (!results.some((r) => /check_messages$/.test(r.name ?? ''))) {
+        return `the model never received a check_messages result (tool results: ${results.map((r) => r.name).join(', ') || 'none'})`
+      }
+      const hits = results.flatMap((r) => Array(r.content.split(setup.marker).length - 1).fill(r.name))
+      if (hits.length === 0) {
+        return 'the waiting note never reached the model: it was claimed where the model cannot see it (the automatic session_start)'
+      }
+      if (hits.length > 1) return `the waiting note reached the model ${hits.length} times (${hits.join(', ')}), expected exactly once`
+      if (!/check_messages$/.test(hits[0] ?? '')) return `the waiting note reached the model through ${hits[0]}, not check_messages`
+      return null
+    },
+  },
 }
 
 main().catch((error) => {
@@ -154,6 +180,7 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
     const home = buildDshHome({ root, fakeUrl: fake.url, plumbSh, hoisted: harness.hoisted })
     const workspace = path.join(root, 'workspace')
     fs.mkdirSync(workspace, { recursive: true })
+    const setup = SCENARIOS[mode].setup ? await SCENARIOS[mode].setup({ workspace, plumbSh }) : {}
 
     const run = await runDsh(harness, ['--profile', 'e2e', task], {
       cwd: workspace,
@@ -175,7 +202,7 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
     if (run.timedOut) console.error(`  dsh timed out after ${RUN_TIMEOUT_MS}ms`)
     console.log(`  dsh exit=${run.code}${run.timedOut ? ' (timed out)' : ''}`)
 
-    const problem = await SCENARIOS[mode].expect({ root })
+    const problem = await SCENARIOS[mode].expect({ root, fake, setup })
     if (problem === null) {
       console.log(`  PASS ${mode}`)
       passed = true
@@ -186,10 +213,118 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
     console.error(`  FAIL ${mode}: ${error.message}`)
   } finally {
     if (fake) await fake.close()
+    // PLAN-507: `plumb serve` daemonizes this scenario's plumb daemon, so
+    // nothing above ends it, and before this every run leaked one per
+    // scenario. Stop it on pass AND fail, before its HOME is deleted, and fail
+    // the scenario if it survives.
+    const leaked = await stopIsolatedDaemon(root)
+    if (leaked.length > 0) {
+      console.error(`  FAIL ${mode}: the isolated plumb daemon survived teardown (pid ${leaked.join(', ')})`)
+      passed = false
+    }
     if (passed && !keep) fs.rmSync(root, { recursive: true, force: true })
     else console.log(`  (kept for debugging: ${root})`)
   }
   return passed
+}
+
+/**
+ * Leave a note for whoever attaches to `workspace` next, from a short-lived
+ * plumb session of its own (plumb's CLI cannot send mail). Speaks MCP's stdio
+ * framing directly, one JSON-RPC message per line, so the harness needs no SDK.
+ * Returns the note's unique marker.
+ */
+async function fileWaitingNote({ workspace, plumbSh }) {
+  const marker = `plan500-waiting-note-${process.pid}-${Date.now()}`
+  const child = spawn(plumbSh, ['serve'], { cwd: workspace, stdio: ['pipe', 'pipe', 'pipe'] })
+  let stderr = ''
+  child.stderr.on('data', (data) => { stderr += data })
+  const pending = new Map()
+  let buffered = ''
+  child.stdout.on('data', (data) => {
+    buffered += data
+    let newline
+    while ((newline = buffered.indexOf('\n')) >= 0) {
+      const line = buffered.slice(0, newline).trim()
+      buffered = buffered.slice(newline + 1)
+      if (!line) continue
+      let message
+      try { message = JSON.parse(line) } catch { continue }
+      if (message.id !== undefined && pending.has(message.id)) {
+        pending.get(message.id)(message)
+        pending.delete(message.id)
+      }
+    }
+  })
+  let nextId = 0
+  const call = (method, params) => new Promise((resolve, reject) => {
+    const id = ++nextId
+    const timer = setTimeout(() => reject(new Error(`${method} timed out; plumb stderr: ${stderr.slice(-400)}`)), DECLARE_TIMEOUT_MS)
+    pending.set(id, (message) => { clearTimeout(timer); resolve(message) })
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`)
+  })
+  const toolCall = async (toolName, args) => {
+    const reply = await call('tools/call', { name: toolName, arguments: args })
+    if (reply.error || reply.result?.isError === true) {
+      const why = reply.error?.message ?? (reply.result?.content ?? []).map((part) => part.text).join(' ')
+      throw new Error(`${toolName} failed: ${String(why).slice(0, 300)}`)
+    }
+    return reply.result
+  }
+  try {
+    await call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'dsh-identity-e2e-sender', version: '1' } })
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
+    await toolCall('session_start', { session_id: 'dsh-identity-e2e-sender', workspace })
+    await toolCall('leave_note', { to: 'next', body: marker })
+    console.log(`  setup: left a note for the next session (${marker})`)
+  } finally {
+    child.stdin.end()
+    await new Promise((resolve) => {
+      if (child.exitCode !== null) return resolve()
+      const timer = setTimeout(() => { child.kill('SIGTERM'); resolve() }, 5_000)
+      child.once('exit', () => { clearTimeout(timer); resolve() })
+    })
+  }
+  return { marker }
+}
+
+/**
+ * Stop this scenario's isolated plumb daemon, found by the pidfile it keeps
+ * under the scenario's own HOME, never by a process-wide sweep. A graceful
+ * SIGTERM, then a bounded wait. The process is confirmed to be a plumb daemon
+ * before it is signalled, so a stale pidfile can't hit an unrelated process.
+ * Returns the pids still alive afterwards.
+ */
+async function stopIsolatedDaemon(root) {
+  const plumbHome = path.join(root, 'plumbhome')
+  if (!fs.existsSync(plumbHome)) return []
+  const pids = walkDirs(plumbHome, 0)
+    .map((dir) => path.join(dir, 'plumb.pid'))
+    .filter((file) => fs.existsSync(file))
+    .map((file) => Number.parseInt(fs.readFileSync(file, 'utf8').trim(), 10))
+    .filter((pid) => Number.isInteger(pid) && pid > 1 && isPlumbDaemon(pid))
+  for (const pid of pids) {
+    try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
+  }
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline && pids.some(isAlive)) await sleep(200)
+  const leaked = pids.filter(isAlive)
+  if (pids.length > 0 && leaked.length === 0) console.log(`  teardown: stopped the isolated plumb daemon (pid ${pids.join(', ')})`)
+  return leaked
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
+}
+
+function isPlumbDaemon(pid) {
+  const ps = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
+  return ps.status === 0 && /\bplumb\b.*\bdaemon\b/.test(ps.stdout)
 }
 
 // -- throwaway environment ---------------------------------------------------------
@@ -241,7 +376,8 @@ llm-pi-ai:
         # control that proves the per-agent assertions fail if the feature
         # silently reverts to stamping.
         perAgentConnection: ${process.env.E2E_PER_AGENT === '0' ? 'false' : 'true'}
-        # Small in the harness so the run ends promptly; 60 s in production.
+        # 60 s here unless E2E_IDLE_MS says otherwise (a smaller value ends
+        # each run sooner); the plugin's production default is 15 s.
         idleMs: ${Number(process.env.E2E_IDLE_MS ?? 60000)}
     - id: mcp-plumb
       name: '@deepseek-ai/dsh-mcp-client'

@@ -15,6 +15,11 @@
 //   - `subagent` — the first request gets a call for DSH's `subagent` tool
 //     (capped at one spawn, so the delegated child cannot recurse); the child
 //     then takes the plumb tool_call the same way the tool-call scenario does.
+//   - `mail` — calls the plumb info tool (whose first call makes the plugin
+//     declare the agent, i.e. an automatic session_start), then plumb's
+//     check_messages, then answers "done". Every tool result the model is sent
+//     is recorded in `toolResults`, so the harness can assert what the model
+//     actually saw.
 //
 // The tool to call is read from the request's own `tools[]` (matched by name
 // shape, never hardcoded), and arguments are filled generically from the
@@ -34,7 +39,7 @@ const FINAL_TEXT = 'done'
 /** Plausible non-zero usage: dsh's token meter reads these fields. */
 const USAGE = { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 }
 
-export const FAKE_MODEL_MODES = ['tool-call', 'text-only', 'subagent', 'per-agent']
+export const FAKE_MODEL_MODES = ['tool-call', 'text-only', 'subagent', 'per-agent', 'mail']
 
 /**
  * Start the fake model on an ephemeral 127.0.0.1 port.
@@ -45,7 +50,7 @@ export function createFakeModel({ mode = 'tool-call', log = () => {} } = {}) {
   if (!FAKE_MODEL_MODES.includes(mode)) {
     throw new Error(`fake-model: unknown mode "${mode}" (expected one of ${FAKE_MODEL_MODES.join(', ')})`)
   }
-  const state = { spawns: 0, requests: [] }
+  const state = { spawns: 0, requests: [], toolResults: [], seenToolResults: new Set() }
   const server = http.createServer((req, res) => {
     collectBody(req)
       .then((body) => route(req, res, body, mode, state, log))
@@ -59,6 +64,8 @@ export function createFakeModel({ mode = 'tool-call', log = () => {} } = {}) {
         url: `http://127.0.0.1:${port}/v1`,
         port,
         requests: state.requests,
+        // Every tool result DSH sent back to the model, once each: { id, name, content }.
+        toolResults: state.toolResults,
         close: () => new Promise((done) => server.close(() => done())),
       })
     })
@@ -91,6 +98,7 @@ function route(req, res, body, mode, state, log) {
   }
   const line = summarize(parsed)
   state.requests.push(line)
+  recordToolResults(parsed, state)
   log(`fake-model <- ${line}`)
   return respond(res, parsed, mode, state)
 }
@@ -114,6 +122,9 @@ function respond(res, parsed, mode, state) {
 function decide(parsed, mode, state) {
   const messages = Array.isArray(parsed.messages) ? parsed.messages : []
   const hasToolResult = messages.some((message) => message.role === 'tool')
+  // `mail` decides by which tools the conversation has already called, so the
+  // tool-result short-circuit below must not apply to it.
+  if (mode === 'mail') return decideMail(parsed, messages)
   // `per-agent` decides on BOTH request shapes — the opening turn calls plumb,
   // the follow-up delegates — so it must not be short-circuited here.
   if (mode === 'text-only' || (hasToolResult && mode !== 'per-agent')) return { kind: 'text' }
@@ -151,6 +162,62 @@ function decide(parsed, mode, state) {
 }
 
 /**
+ * `mail`: daemon_info first (the agent's first plumb call, which makes the
+ * plugin declare it), then check_messages, then text. Each call gets its own id
+ * so the recorded tool results can be told apart.
+ */
+function decideMail(parsed, messages) {
+  const tools = (Array.isArray(parsed.tools) ? parsed.tools : [])
+    .map((entry) => entry?.function ?? (typeof entry?.name === 'string' ? entry : null))
+    .filter(Boolean)
+  const called = calledToolNames(messages)
+  const steps = [[/daemon_info$/, 'call_e2e_info'], [/check_messages$/, 'call_e2e_mail']]
+  for (const [pattern, id] of steps) {
+    if (called.some((toolName) => pattern.test(toolName))) continue
+    const tool = tools.find((entry) => pattern.test(entry.name))
+    if (!tool) return { kind: 'text' }
+    return { kind: 'tool', name: tool.name, args: fillArguments(tool), id }
+  }
+  return { kind: 'text' }
+}
+
+/** Names of the tools the assistant has already called in this conversation. */
+function calledToolNames(messages) {
+  return messages
+    .filter((message) => message.role === 'assistant' && Array.isArray(message.tool_calls))
+    .flatMap((message) => message.tool_calls.map((call) => call?.function?.name))
+    .filter((toolName) => typeof toolName === 'string')
+}
+
+/**
+ * Record each tool result the model is sent, once: the same result rides along
+ * in every later request of the conversation. The tool's name comes from the
+ * assistant call with the same id.
+ */
+function recordToolResults(parsed, state) {
+  const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+  const names = new Map()
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !Array.isArray(message.tool_calls)) continue
+    for (const call of message.tool_calls) names.set(call?.id, call?.function?.name)
+  }
+  for (const message of messages) {
+    if (message.role !== 'tool') continue
+    const content = textOf(message.content)
+    const key = `${message.tool_call_id}\u0000${content}`
+    if (state.seenToolResults.has(key)) continue
+    state.seenToolResults.add(key)
+    state.toolResults.push({ id: message.tool_call_id, name: names.get(message.tool_call_id) ?? null, content })
+  }
+}
+
+function textOf(content) {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) return content.map((part) => (typeof part === 'string' ? part : part?.text ?? '')).join('\n')
+  return ''
+}
+
+/**
  * Fill a tool call's arguments from the tool's declared JSON schema: every
  * required property gets a usable placeholder, and `run_in_background` is
  * forced false when offered so a delegated subagent is awaited within this
@@ -185,7 +252,7 @@ function streamChunks(decision, model, wantsUsage) {
   const chunks = []
   if (decision.kind === 'tool') {
     chunks.push(
-      { ...chunk(), choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'call_e2e_1', type: 'function', function: { name: decision.name, arguments: '' } }] }, finish_reason: null }] },
+      { ...chunk(), choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: decision.id ?? 'call_e2e_1', type: 'function', function: { name: decision.name, arguments: '' } }] }, finish_reason: null }] },
       { ...chunk(), choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: JSON.stringify(decision.args) } }] }, finish_reason: null }] },
       { ...chunk(), choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
     )
@@ -204,7 +271,7 @@ function completionBody(decision, model) {
     ? {
         role: 'assistant',
         content: null,
-        tool_calls: [{ id: 'call_e2e_1', type: 'function', function: { name: decision.name, arguments: JSON.stringify(decision.args) } }],
+        tool_calls: [{ id: decision.id ?? 'call_e2e_1', type: 'function', function: { name: decision.name, arguments: JSON.stringify(decision.args) } }],
       }
     : { role: 'assistant', content: FINAL_TEXT }
   return {
