@@ -197,6 +197,41 @@ export function mcpContentText (content, toolName) {
 }
 
 /**
+ * The arguments of an automatic session_start for one agent.
+ *
+ * `mail: 'preview'` unless the server is known not to take it. The server
+ * defaults session_start to 'claim', which delivers waiting notes exactly once,
+ * into the orientation packet. This call is automatic, and its packet never
+ * reaches the model, so 'claim' would hand a waiting note to nobody: it would
+ * be gone from check_messages, lost rather than delayed (PLAN-500).
+ * 'preview' shows what is waiting without marking it read, so the model still
+ * receives it when it asks. The argument shipped in plumb 0.24.0 (PLAN-496),
+ * and this is the other half of that fix.
+ */
+export function declarationArgs (cfg, agentContext, ident, withMailPreview) {
+  const args = {
+    session_id: ident.id,
+    workspace: ident.workspace,
+    purpose: agentContext.isSubagent ? cfg.subagentPurpose : cfg.purpose,
+    detail: cfg.detail
+  }
+  if (withMailPreview) args.mail = 'preview'
+  return args
+}
+
+/**
+ * Whether a session_start result is a plumb older than 0.24 refusing the
+ * `mail` argument it does not know. Its argument guard answers an unknown
+ * parameter with an ordinary tool error (`session_start: unknown parameter
+ * "mail"…`), not a transport failure. Matched on that exact parameter, so no
+ * other refusal (a pin refusal, a bad workspace) is ever mistaken for it.
+ */
+export function refusesMailPreview (result) {
+  if (result?.isError !== true) return false
+  return /unknown parameter "mail"/.test(mcpContentText(result.content, 'session_start'))
+}
+
+/**
  * Resolve the caller identity from one tool execution, or null when the
  * caller carries no DSH session (then the call passes through unstamped).
  *
@@ -297,6 +332,12 @@ export async function apply (ctx, config) {
   // Client instance -> Set<sessionId> already reported, so a failure that keeps
   // recurring does not become a warning on every plumb call.
   const declarationNotified = new WeakMap()
+  // Clients whose plumb refused `mail: 'preview'` (plumb < 0.24): later
+  // declarations on them omit it rather than paying the refusal again. Kept per
+  // client, never process-wide, so a daemon upgraded mid-process is picked up
+  // by the next connection.
+  const noMailPreview = new WeakSet()
+  let mailFallbackWarned = false
   let plumbClientRef = null // WeakRef to the captured plumb Client
   let restorePatch = null
   // Proof of DELIVERY, not of intent. The patch installing proves nothing: it
@@ -412,14 +453,21 @@ export async function apply (ctx, config) {
     return true
   }
 
+  /**
+   * Remember that this client's plumb predates `mail`, and say so once: the
+   * fallback works, but its automatic session_start claims waiting notes again,
+   * which a reader of the log needs to know.
+   */
+  function noteNoMailPreview (client) {
+    noMailPreview.add(client)
+    if (mailFallbackWarned) return
+    mailFallbackWarned = true
+    ctx.logger?.warn?.(`${name}: this plumb predates session_start's \`mail\` argument (plumb < 0.24), so declarations are sent without mail: 'preview' and their automatic session_start will claim waiting notes the model never sees. Upgrade plumb to fix it.`)
+  }
+
   /** One declaration request, optionally forcing it. Never stamped (see below). */
   function sendDeclaration (client, agentContext, ident, resultSchema, force) {
-    const args = {
-      session_id: ident.id,
-      workspace: ident.workspace,
-      purpose: agentContext.isSubagent ? cfg.subagentPurpose : cfg.purpose,
-      detail: cfg.detail
-    }
+    const args = declarationArgs(cfg, agentContext, ident, !noMailPreview.has(client))
     if (force) args.force = true
     return client.request({
       method: 'tools/call',
@@ -440,6 +488,12 @@ export async function apply (ctx, config) {
     let result
     try {
       result = await sendDeclaration(client, agentContext, ident, resultSchema, false)
+      if (refusesMailPreview(result)) {
+        // An older plumb: the same declaration without `mail` is what it
+        // accepted before PLAN-500, so this restores exactly that behaviour.
+        noteNoMailPreview(client)
+        result = await sendDeclaration(client, agentContext, ident, resultSchema, false)
+      }
     } catch (error) {
       if (noteDeclarationOnce(client, agentContext.sessionId)) {
         ctx.logger?.warn?.(`${name}: session_start for ${ident.id} could not be sent (${String(error).slice(0, 160)}); the call proceeds with the _meta stamp only and a later call will retry`)
@@ -631,14 +685,22 @@ export async function apply (ctx, config) {
 
       // Declare this agent ON ITS OWN CONNECTION. Nothing else shares it, so
       // the id and the workspace pin cannot land on another agent's shard.
-      const args = {
-        session_id: ident.id,
-        workspace: ident.workspace,
-        purpose: agentContext.isSubagent ? cfg.subagentPurpose : cfg.purpose,
-        detail: cfg.detail
-      }
+      // Automatic, like the shared declaration, so it previews mail rather than
+      // claiming it (declarationArgs says why). callTool returns plumb's refusal
+      // as an ordinary isError result, so it is read, not left to a catch.
+      const declare = (withMailPreview) => client.callTool(
+        { name: 'session_start', arguments: declarationArgs(cfg, agentContext, ident, withMailPreview) },
+        resultSchema ?? undefined
+      )
       try {
-        await client.callTool({ name: 'session_start', arguments: args }, resultSchema ?? undefined)
+        let declared = await declare(true)
+        if (refusesMailPreview(declared)) {
+          noteNoMailPreview(client)
+          declared = await declare(false)
+        }
+        if (declared?.isError === true) {
+          ctx.logger?.warn?.(`${name}: plumb refused the declaration of ${ident.id} on its own connection (${mcpContentText(declared.content, 'session_start').slice(0, 160)}); the connection is still private to this agent`)
+        }
       } catch (error) {
         // Not fatal: the connection is still this agent's own, so the worst
         // case is an undeclared shard, which the AGENTS.md surface covers.

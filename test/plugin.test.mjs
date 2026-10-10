@@ -12,7 +12,7 @@ const pluginUrl = new URL('../dsh-plumb-identity.mjs', import.meta.url)
 const fixtureDshHome = join(here, 'fixtures/dshhome')
 const fixtureSdkUrl = new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js', import.meta.url).href
 
-const { name, inject, defaultConfig, resolveAgentContext, mintIdentity, shouldSkip, apply, resolvePlumbCommand, mcpContentText } = await import(pluginUrl)
+const { name, inject, defaultConfig, resolveAgentContext, mintIdentity, shouldSkip, apply, resolvePlumbCommand, mcpContentText, refusesMailPreview } = await import(pluginUrl)
 const { requests, toolCalls, clients, fixtureState, Client } = await import(fixtureSdkUrl)
 const { spawned, instances } = await import(new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js', import.meta.url).href)
 
@@ -242,7 +242,10 @@ test('second call issues exactly one proactive session_start with the right argu
       session_id: 'dsh-w-b-conv-bbb',
       workspace: '/w/b',
       purpose: 'dsh',
-      detail: 'brief'
+      detail: 'brief',
+      // An automatic session_start must never CLAIM mail into a packet the model
+      // does not read (PLAN-500).
+      mail: 'preview'
     })
     assert.equal(declares[0].params._meta, undefined, 'the proactive declaration must travel unstamped')
     await wrap(exec, async () => 'r3')
@@ -563,10 +566,17 @@ test("a plumb call runs over the agent's OWN connection, never the shared one", 
     assert.deepEqual(spawned[0].args, ['serve'])
     assert.equal(spawned[0].cwd, '/w/own')
 
-    // Declared on that connection, with this agent's minted id and workspace.
+    // Declared on that connection, with this agent's minted id and workspace,
+    // previewing mail rather than claiming it: this is the DEFAULT path, so it is
+    // the one that loses a note if the argument goes missing (PLAN-500).
     const declare = toolCalls.find((call) => call.name === 'session_start')
-    assert.equal(declare.arguments.session_id, 'dsh-w-own-conv-own')
-    assert.equal(declare.arguments.workspace, '/w/own')
+    assert.deepEqual(declare.arguments, {
+      session_id: 'dsh-w-own-conv-own',
+      workspace: '/w/own',
+      purpose: 'dsh',
+      detail: 'brief',
+      mail: 'preview'
+    })
 
     // The call itself went over the SAME client instance.
     const invoked = toolCalls.find((call) => call.name === 'read_file')
@@ -691,4 +701,142 @@ test('dispose closes every per-agent connection', async () => {
   await ctx.handlers.dispose?.()
   assert.equal(instances[0].closed, true, 'the transport is closed on dispose')
   assert.ok(clients.every((client) => client.closed === true), 'the client is closed on dispose')
+})
+
+// -- plumb older than 0.24 (no `mail` argument) ---------------------------------
+//
+// plumb's argument guard refuses a parameter it does not know with an ordinary
+// tool error, so a plumb that predates session_start's `mail` refuses the whole
+// declaration. Without a fallback, adding `mail: 'preview'` would leave every
+// agent undeclared on such a daemon, which is worse than claiming mail.
+
+const oldPlumbRefusal = () => ({
+  kind: 'invalid_arguments',
+  refusalText: 'session_start: unknown parameter "mail". Valid parameters: session_id, workspace, purpose, detail, force'
+})
+
+const pinRefusal = () => ({
+  kind: 'pin_refused',
+  retryable: true,
+  remediation: { class: 'repin_workspace', tool: 'session_start' },
+  details: { scope: 'connection', pinned: '/w/other', requested: '/w/m' }
+})
+
+test('refusesMailPreview matches only an unknown `mail` parameter', () => {
+  const text = (t) => [{ type: 'text', text: t }]
+  assert.equal(refusesMailPreview({ isError: true, content: text('session_start: unknown parameter "mail". Valid parameters: session_id') }), true)
+  assert.equal(refusesMailPreview({ isError: false, content: text('unknown parameter "mail"') }), false, 'a success is never a refusal')
+  assert.equal(refusesMailPreview({ isError: true, content: text('session_start: unknown parameter "force"') }), false, 'another unknown parameter is not this one')
+  assert.equal(refusesMailPreview({ isError: true, content: text('refused') }), false)
+  assert.equal(refusesMailPreview(undefined), false)
+})
+
+test('shared connection: an older plumb refusing `mail` is retried once without it, and remembered', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  fixtureState.sessionStartRefusals = [oldPlumbRefusal()]
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = { name: 'mcp__plumb__daemon_info', ...conversation('conv-old', '/w/m') }
+    await wrap(exec, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'daemon_info', arguments: {} } }, { parse: (v) => v })
+      return 'r1'
+    })
+    await wrap(exec, async () => 'r2')
+    const declares = requests.filter((r) => r.params.name === 'session_start')
+    assert.equal(declares.length, 2, 'refused once, then retried once')
+    assert.equal(declares[0].params.arguments.mail, 'preview')
+    assert.equal('mail' in declares[1].params.arguments, false, 'the retry omits mail')
+    assert.equal(declares[1].params.arguments.session_id, 'dsh-w-m-conv-old', 'the retry is the same declaration')
+    assert.ok(ctx.logs.some(([level, msg]) => level === 'info' && msg.includes('declared dsh-w-m-conv-old')), 'the agent ends up declared')
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('predates')).length, 1)
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('refused the declaration')).length, 0, 'the fallback is not reported as a refusal')
+
+    // A second agent on the same client goes straight to the form it accepts.
+    const other = { name: 'mcp__plumb__daemon_info', ...conversation('conv-old2', '/w/m') }
+    await wrap(other, async () => 'r3')
+    const after = requests.filter((r) => r.params.name === 'session_start')
+    assert.equal(after.length, 3, 'one declaration for the second agent, no second refusal')
+    assert.equal('mail' in after[2].params.arguments, false)
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('predates')).length, 1, 'warned once, not per agent')
+  } finally {
+    fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('shared connection: any other refusal does not trigger the mail fallback', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  fixtureState.sessionStartRefusals = [pinRefusal()]
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = { name: 'mcp__plumb__daemon_info', ...conversation('conv-pin', '/w/m') }
+    await wrap(exec, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'daemon_info', arguments: {} } }, { parse: (v) => v })
+      return 'r1'
+    })
+    await wrap(exec, async () => 'r2')
+    const declares = requests.filter((r) => r.params.name === 'session_start')
+    assert.equal(declares.length, 1, 'a pin refusal is not retried as a mail fallback')
+    assert.equal(declares[0].params.arguments.mail, 'preview')
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('predates')).length, 0)
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('refused the declaration')).length, 1, 'still reported as the refusal it is')
+  } finally {
+    fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test("per-agent connection: an older plumb refusing `mail` is retried once without it on the agent's own client", async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  fixtureState.sessionStartRefusals = [oldPlumbRefusal()]
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const result = await wrap(
+      { name: 'mcp__plumb__read_file', arguments: { file_path: '/w/m/x.go' }, ...conversation('conv-pa-old', '/w/m') },
+      async () => { throw new Error('the shared connection must not be used') }
+    )
+    const declares = toolCalls.filter((call) => call.name === 'session_start')
+    assert.equal(declares.length, 2, 'refused once, then retried once')
+    assert.equal(declares[0].arguments.mail, 'preview')
+    assert.equal('mail' in declares[1].arguments, false, 'the retry omits mail')
+    assert.equal(declares[1].clientId, declares[0].clientId, "the retry stays on the agent's own client")
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('predates')).length, 1)
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('refused the declaration')).length, 0)
+    assert.equal(result.isError, false, 'the call itself still goes through')
+  } finally {
+    fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('per-agent connection: any other refusal is reported, not retried as a mail fallback', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  fixtureState.sessionStartRefusals = [pinRefusal()]
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    await wrap(
+      { name: 'mcp__plumb__read_file', arguments: {}, ...conversation('conv-pa-pin', '/w/m') },
+      async () => 'shared'
+    )
+    const declares = toolCalls.filter((call) => call.name === 'session_start')
+    assert.equal(declares.length, 1, 'no mail fallback for a pin refusal')
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('predates')).length, 0)
+    const refused = ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('refused the declaration of dsh-w-m-conv-pa-pin'))
+    assert.equal(refused.length, 1, 'a refusal on the own connection is reported, not silently ignored')
+  } finally {
+    fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
 })
