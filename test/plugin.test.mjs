@@ -767,6 +767,40 @@ test('shared connection: an older plumb refusing `mail` is retried once without 
   }
 })
 
+test('shared connection: an agent-scope refusal after the mail fallback is forced WITHOUT mail', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  requests.length = 0
+  // An older plumb that also refuses the pin at agent scope: the fallback's
+  // mail-less retry is refused, and the forced retry must stay mail-less too.
+  fixtureState.sessionStartRefusals = [
+    oldPlumbRefusal(),
+    { kind: 'pin_refused', retryable: true, details: { scope: 'agent', pinned: '/w/other', requested: '/w/m' } }
+  ]
+  const ctx = stubCtx()
+  await mount(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    const exec = { name: 'mcp__plumb__daemon_info', ...conversation('conv-old-force', '/w/m') }
+    await wrap(exec, async () => {
+      await new Client().request({ method: 'tools/call', params: { name: 'daemon_info', arguments: {} } }, { parse: (v) => v })
+      return 'r1'
+    })
+    await wrap(exec, async () => 'r2')
+    const declares = requests.filter((r) => r.params.name === 'session_start')
+    assert.equal(declares.length, 3, 'with mail, then without, then forced')
+    assert.equal(declares[0].params.arguments.mail, 'preview')
+    assert.equal('mail' in declares[1].params.arguments, false)
+    assert.equal(declares[1].params.arguments.force, undefined)
+    assert.equal('mail' in declares[2].params.arguments, false, 'an older plumb would refuse a forced retry that carried mail')
+    assert.equal(declares[2].params.arguments.force, true)
+    assert.ok(ctx.logs.some(([level, msg]) => level === 'info' && msg.includes('after a per-agent re-pin refusal')), 'the agent ends up declared')
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('refused the declaration')).length, 0)
+  } finally {
+    fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
+})
+
 test('shared connection: any other refusal does not trigger the mail fallback', async () => {
   process.env.DSH_HOME = fixtureDshHome
   requests.length = 0
