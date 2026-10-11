@@ -122,6 +122,7 @@ Six scenarios:
 - `mail` — a note is left for "whoever attaches next" before the agent's first plumb call; the model must receive it from `check_messages` exactly once. This is the regression test for the automatic `session_start` consuming mail. Remove `mail: "preview"` from the plugin and it fails with "claimed where the model cannot see it".
 - `reconnect` — a note is sent to the agent WHILE it is connected, its own connection then idle-closes (an 8 s `idleMs`; the fake model is held between its two calls until plumb records the end), and the model's `check_messages` runs over a new connection. The note must arrive exactly once and the agent's declared session id must not change. The red control is `E2E_RESUME_PROOF=0 node test/e2e-mock-provider.mjs --mode reconnect`, which mounts the plugin with `resumeProof: false` and must FAIL with the note "stranded on session …" and a second session id.
 - `declared-id` — the `reconnect` steps plus a `session_start` the MODEL declares with a `session_id` and `workspace` of its own, which is what the brief tells a DSH agent to do. Exactly one linkage must survive: no record may carry the typed id, no connection may be marked `shared_connection_detected`, the daemon must not log a shared connection, and the note must still arrive exactly once with the session id unchanged. The red control is `E2E_NORMALISE=0 node test/e2e-mock-provider.mjs --mode declared-id`, which mounts the plugin with `normaliseDeclarations: false` and must FAIL with "the daemon reported a shared connection".
+- `declared-id-fallback` — the same takeover on the SHARED connection (`perAgentConnection: false`), where the reconnect assertions do not apply. `prepareCall` normalises for both dispatch paths and the unit test only proves the arguments object is rewritten, so this scenario pins that real DSH sends the rewritten object down that path: no record may carry the typed id, no connection may be marked shared, and the daemon must not log a shared connection. The red control is `E2E_NORMALISE=0 node test/e2e-mock-provider.mjs --mode declared-id-fallback`, which must FAIL with "marked 1 connection(s) shared_connection_detected".
 
 The first four assert on plumb's own session records; `mail` asserts on the tool results the fake model was actually sent, and `reconnect` and `declared-id` on both. Every scenario stops its own isolated plumb daemon on the way out, found by the pidfile under its temp `HOME` (never a process-wide sweep), on pass and on fail. A daemon that survives fails the scenario.
 
@@ -152,8 +153,8 @@ confused for each other.
   a value that is not a positive number falls back to the default.
 - `normaliseDeclarations` (default `true`) takes over a `session_start` whose
   arguments name a linkage of the model's own, so a connection carries exactly
-  ONE (below). `false` passes the model's id through verbatim — the e2e red
-  control, and an escape hatch.
+  ONE (below). `false` passes the model's id through verbatim, without the
+  connection's resume proof — the e2e red control, and an escape hatch.
 - `PLUMB_IDENTITY_DEBUG=1` traces the connection lifecycle to stderr.
 
 ### Reconnects keep the plumb session (resume proof)
@@ -218,9 +219,12 @@ typed is dropped, and everything else it asked for — `workspace` (an intention
 re-pin), `purpose`, `detail`, `mail` — is passed through untouched. The takeover
 is reported once per agent in the DSH log, naming both ids.
 
-The per-agent connection also carries the resume proof on that declaration, not
-only on the one it opened with: if the opening declaration could not be proved,
-this is the second chance to link the conversation to a credential. The
+The per-agent connection also carries the resume proof on that declaration —
+when it names the connection's own id, which with normalisation on it always
+does: if the opening declaration could not be proved, this is the second chance
+to link the conversation to a credential. A declaration the plugin did NOT take
+over (`normaliseDeclarations: false`) goes out verbatim instead: no rewrite, no
+stamp, no proof — which is also the shape a live DSH agent sends. The
 shared-connection fallback keeps its declaration unproved, here and everywhere:
 one serve carries many conversations, and plumb's `claim()` lets a serve process
 link exactly ONE conversation for its whole life, so proving there would bar

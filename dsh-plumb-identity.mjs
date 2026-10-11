@@ -352,12 +352,15 @@ export function resumeProofFields (id, stdout) {
  * caller asked for — `workspace` (an intentional re-pin), `purpose`, `detail`,
  * `mail` — is left exactly as typed. Returns null when there is nothing to
  * change, so a declaration that already names this connection's id stays
- * byte-for-byte as the model wrote it and is not logged.
+ * byte-for-byte as the model wrote it and is not logged. A MISSING or
+ * non-object argument set is treated as empty rather than left alone: the id
+ * comes from the harness, so a session_start with no arguments still declares
+ * this connection's id instead of none at all.
  */
 export function normaliseSessionStart (args, id) {
-  if (args === null || typeof args !== 'object' || Array.isArray(args)) return null
+  const from = args !== null && typeof args === 'object' && !Array.isArray(args) ? args : {}
   let changed = false
-  const next = { ...args }
+  const next = { ...from }
   for (const key of stampKeys) {
     if (key in next) {
       delete next[key]
@@ -993,16 +996,17 @@ export async function apply (ctx, config) {
     touch(agentContext.sessionId, entry)
     debug('dispatch', rawName, 'over client for', agentContext.sessionId)
 
-    // The proof rides the session_start that names the conversation, not only
-    // the declaration this connection opened with: if that one could not be
-    // proved (hook too slow, key unreadable), this call is the second chance to
-    // link the conversation to a credential. It is deliberately NOT attached on
-    // the shared fallback: that serve carries many conversations, and plumb's
-    // claim() lets a serve process link exactly one for its whole life
-    // (internal/cli/serve_resume.go), so proving there would bar every other
-    // agent on it and file a credential it can never present.
+    // The proof belongs to a declaration that names THIS connection's id — with
+    // normalisation on that is every session_start, since prepareCall rewrote
+    // it. With `normaliseDeclarations: false` it deliberately is not: the
+    // declaration goes out verbatim, no stamp and no proof, which is also the
+    // shape a live DSH agent sends. It is never attached on the shared fallback:
+    // that serve carries many conversations, and plumb's claim() lets a serve
+    // process link exactly one for its whole life (internal/cli/serve_resume.go),
+    // so proving there would bar every other agent on it and file a credential
+    // it can never present.
     let args = exec.arguments ?? {}
-    if (rawName === 'session_start') {
+    if (rawName === 'session_start' && args.session_id === ident.id) {
       const proof = await resumeProofFor(ident)
       if (Object.keys(proof).length > 0) args = { ...args, ...proof }
     }

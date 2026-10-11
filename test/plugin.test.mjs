@@ -1097,9 +1097,12 @@ test('per-agent connection: each connection proves its own agent, and the mail f
 test('normaliseSessionStart takes over a typed declaration, and leaves a matching one alone', () => {
   assert.equal(normaliseSessionStart({ session_id: 'mine', workspace: '/w' }, 'mine'), null,
     'a declaration that already names this connection’s id is a no-op')
-  assert.equal(normaliseSessionStart(null, 'x'), null)
-  assert.equal(normaliseSessionStart([], 'x'), null)
-  assert.equal(normaliseSessionStart('session_id=x', 'x'), null)
+  // A missing or non-object argument set is treated as EMPTY, not as "leave it
+  // alone": the id comes from the harness, so the declaration still names it.
+  for (const missing of [null, undefined, [], 'session_id=x']) {
+    assert.deepEqual(normaliseSessionStart(missing, 'x'), { session_id: 'x' },
+      `a ${JSON.stringify(missing)} argument set still declares the harness id`)
+  }
 
   assert.deepEqual(
     normaliseSessionStart({
@@ -1153,13 +1156,41 @@ test('per-agent connection: a model-typed session_id is normalised to the proven
     assert.equal(reported.length, 1, 'reported, once')
     assert.match(reported[0][1], /declared session_id dsh-plumb-ops-r4t9/)
 
+    // A second declaration with YET ANOTHER typed id is still one report — the
+    // notice is per agent, not per call. (A matching id would not exercise the
+    // path at all, which is how this assertion once passed vacuously.)
     await ctx.handlers['tools/execute']({
       name: 'mcp__plumb__session_start',
-      arguments: { session_id: 'dsh-w-one-conv-one' },
+      arguments: { session_id: 'typed-again', probe: 'second-call' },
       ...conversation('conv-one', '/w/one')
     }, async () => 'shared')
     assert.equal(ctx.logs.filter(([level, msg]) => level === 'info' && msg.includes('normalised to it')).length, 1,
-      'a declaration that already matches is not reported again')
+      'reported once per agent, not once per call')
+    const second = toolCalls.filter((call) => call.name === 'session_start').find((call) => call.arguments.probe === 'second-call')
+    assert.equal(second.arguments.session_id, 'dsh-w-one-conv-one', 'the second typed id is taken over too')
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('normaliseDeclarations false: the declaration goes out verbatim, with no proof', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const ctx = stubCtx()
+  await mountPerAgent(ctx, { normaliseDeclarations: false })
+  try {
+    await ctx.handlers['tools/execute']({
+      name: 'mcp__plumb__session_start',
+      arguments: { session_id: 'typed-by-the-model', workspace: '/w/vb', probe: 'verbatim' },
+      ...conversation('conv-vb', '/w/vb')
+    }, async () => 'shared')
+    const mine = toolCalls.filter((call) => call.name === 'session_start').find((call) => call.arguments.probe === 'verbatim')
+    assert.ok(mine, 'the call reached the agent’s own connection')
+    assert.equal(mine.arguments.session_id, 'typed-by-the-model', 'the typed id is passed through')
+    assert.equal(mine.arguments.workspace, '/w/vb')
+    assert.equal('plumb_hook_proof' in mine.arguments, false,
+      'a declaration the plugin did not take over is not dressed up with the connection’s proof')
+    assert.equal('plumb_agent' in mine.arguments, false)
   } finally {
     await ctx.handlers.dispose?.()
   }

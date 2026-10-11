@@ -172,6 +172,21 @@ const SCENARIOS = {
       return expectNoteSurvivedReconnect(ctx)
     },
   },
+  // The same takeover on the SHARED connection. `prepareCall` normalises for
+  // both dispatch paths, and the unit test only proves the arguments object is
+  // rewritten — not that real DSH sends the rewritten object down this path. So
+  // this pins the wire: exactly one linkage reaches the daemon even though the
+  // model declared its own. The reconnect assertions do not apply here (a
+  // shared serve has no own connection to resume), so this is the shared half
+  // of `declared-id`, pinned rather than checked by hand.
+  // Control: E2E_NORMALISE=0 mounts the plugin with `normaliseDeclarations:
+  // false`, and this scenario must FAIL.
+  'declared-id-fallback': {
+    fakeMode: 'declared-id',
+    perAgentConnection: false,
+    task: 'Use the mcp__plumb__session_start tool once with a session_id of your own choosing, then the mcp__plumb__daemon_info tool once, then reply with exactly: done',
+    expect: declaredIdWasTakenOver,
+  },
 }
 
 /**
@@ -295,14 +310,18 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
     // session_id, the way the brief tells a DSH agent to (see decideDeclaredId).
     const workspace = path.join(root, 'workspace')
     fake = await createFakeModel({
-      mode,
+      mode: scenario.fakeMode ?? mode,
       log: (line) => console.log(`  ${line}`),
       beforeCheckMessages: scenario.gate ? () => runGate() : undefined,
       workspace,
     })
     const plumbSh = writePlumbWrapper({ root, plumbBin })
     const idleMs = scenario.idleMs ?? Number(process.env.E2E_IDLE_MS ?? 60000)
-    const home = buildDshHome({ root, fakeUrl: fake.url, plumbSh, hoisted: harness.hoisted, idleMs })
+    // A scenario may pin the topology it needs (declared-id-fallback); otherwise
+    // E2E_PER_AGENT=0 is the standing control that runs every scenario on the
+    // shared connection.
+    const perAgent = scenario.perAgentConnection ?? process.env.E2E_PER_AGENT !== '0'
+    const home = buildDshHome({ root, fakeUrl: fake.url, plumbSh, hoisted: harness.hoisted, idleMs, perAgent })
     fs.mkdirSync(workspace, { recursive: true })
     const setup = scenario.setup ? await scenario.setup({ workspace, plumbSh }) : {}
     if (scenario.gate) {
@@ -491,7 +510,7 @@ function isPlumbDaemon(pid) {
 
 // -- throwaway environment ---------------------------------------------------------
 
-function buildDshHome({ root, fakeUrl, plumbSh, hoisted, idleMs }) {
+function buildDshHome({ root, fakeUrl, plumbSh, hoisted, idleMs, perAgent }) {
   const home = path.join(root, 'dsh-home')
   const profile = path.join(home, 'profiles', 'e2e')
   fs.mkdirSync(profile, { recursive: true })
@@ -537,7 +556,7 @@ llm-pi-ai:
         # E2E_PER_AGENT=0 runs the SAME scenario on the shared connection: the
         # control that proves the per-agent assertions fail if the feature
         # silently reverts to stamping.
-        perAgentConnection: ${process.env.E2E_PER_AGENT === '0' ? 'false' : 'true'}
+        perAgentConnection: ${perAgent ? 'true' : 'false'}
         # 60 s here unless the scenario or E2E_IDLE_MS says otherwise (a
         # smaller value ends each run sooner); the production default is 15 s.
         idleMs: ${idleMs}
