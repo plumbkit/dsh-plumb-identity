@@ -33,6 +33,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createFakeModel, TYPED_SESSION_ID } from './fake-model.mjs'
+import { endProcessGroup, stopIsolatedDaemon, walkDirs } from './isolated-daemon.mjs'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PLUGIN_FILE = path.join(REPO_ROOT, 'dsh-plumb-identity.mjs')
@@ -262,6 +263,35 @@ function readDaemonLog(root) {
   return ''
 }
 
+// Scenario roots whose daemon has not been torn down yet, and the process groups
+// of dsh runs not yet ended. A runner stopped by a signal (a tool timeout, ^C)
+// never reaches runScenario's finally, so end and stop these before exiting.
+const liveRoots = new Set()
+const liveGroups = new Set()
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.once(signal, () => {
+    console.error(`\ne2e: ${signal}: stopping the plumb daemon of ${liveRoots.size} unfinished scenario(s)`)
+    endDshGroups()
+      .then((problems) => problems.forEach((problem) => console.error(`  teardown: ${problem}`)))
+      .then(() => Promise.all([...liveRoots].map(async (root) => {
+        const { problems } = await stopIsolatedDaemon(path.join(root, 'plumbhome'))
+        for (const problem of problems) console.error(`  teardown: ${problem} (kept: ${root})`)
+      })))
+      .finally(() => process.exit(128 + os.constants.signals[signal]))
+  })
+}
+
+/** End every dsh process group still recorded, with whatever serves it holds. */
+async function endDshGroups() {
+  const problems = []
+  for (const pgid of liveGroups) {
+    const problem = await endProcessGroup(pgid)
+    if (problem) problems.push(problem)
+    liveGroups.delete(pgid)
+  }
+  return problems
+}
+
 main().catch((error) => {
   console.error(`e2e: ${error.message}`)
   process.exit(1)
@@ -298,6 +328,7 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
   // the 104-byte sun_path ceiling (plumb refuses with exactly that hint).
   const parent = fs.existsSync('/tmp') ? '/tmp' : os.tmpdir()
   const root = fs.mkdtempSync(path.join(parent, `dsh-identity-e2e-${mode}-`))
+  liveRoots.add(root)
   let fake
   let passed = false
   const scenario = SCENARIOS[mode]
@@ -362,15 +393,23 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
     console.error(`  FAIL ${mode}: ${error.message}`)
   } finally {
     if (fake) await fake.close()
-    // PLAN-507: `plumb serve` daemonizes this scenario's plumb daemon, so
-    // nothing above ends it, and before this every run leaked one per
-    // scenario. Stop it on pass AND fail, before its HOME is deleted, and fail
-    // the scenario if it survives.
-    const leaked = await stopIsolatedDaemon(root)
-    if (leaked.length > 0) {
-      console.error(`  FAIL ${mode}: the isolated plumb daemon survived teardown (pid ${leaked.join(', ')})`)
+    // End dsh and any serve it left before stopping the daemon, or that serve
+    // redials and starts a new one.
+    for (const problem of await endDshGroups()) {
+      console.error(`  FAIL ${mode}: teardown: ${problem}`)
       passed = false
     }
+    // PLAN-507: `plumb serve` daemonizes this scenario's plumb daemon, so
+    // nothing above ends it. Stop it on pass AND fail, before its HOME is
+    // deleted, and fail the scenario (keeping the root) unless teardown can
+    // show no daemon is left; see isolated-daemon.mjs.
+    const { stopped, problems } = await stopIsolatedDaemon(path.join(root, 'plumbhome'))
+    if (stopped.length > 0) console.log(`  teardown: stopped the isolated plumb daemon (pid ${stopped.join(', ')})`)
+    for (const problem of problems) {
+      console.error(`  FAIL ${mode}: teardown: ${problem}`)
+      passed = false
+    }
+    liveRoots.delete(root)
     if (passed && !keep) fs.rmSync(root, { recursive: true, force: true })
     else console.log(`  (kept for debugging: ${root})`)
   }
@@ -469,45 +508,6 @@ async function sendNote({ workspace, plumbSh, to, body }) {
   }
 }
 
-/**
- * Stop this scenario's isolated plumb daemon, found by the pidfile it keeps
- * under the scenario's own HOME, never by a process-wide sweep. A graceful
- * SIGTERM, then a bounded wait. The process is confirmed to be a plumb daemon
- * before it is signalled, so a stale pidfile can't hit an unrelated process.
- * Returns the pids still alive afterwards.
- */
-async function stopIsolatedDaemon(root) {
-  const plumbHome = path.join(root, 'plumbhome')
-  if (!fs.existsSync(plumbHome)) return []
-  const pids = walkDirs(plumbHome, 0)
-    .map((dir) => path.join(dir, 'plumb.pid'))
-    .filter((file) => fs.existsSync(file))
-    .map((file) => Number.parseInt(fs.readFileSync(file, 'utf8').trim(), 10))
-    .filter((pid) => Number.isInteger(pid) && pid > 1 && isPlumbDaemon(pid))
-  for (const pid of pids) {
-    try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ }
-  }
-  const deadline = Date.now() + 10_000
-  while (Date.now() < deadline && pids.some(isAlive)) await sleep(200)
-  const leaked = pids.filter(isAlive)
-  if (pids.length > 0 && leaked.length === 0) console.log(`  teardown: stopped the isolated plumb daemon (pid ${pids.join(', ')})`)
-  return leaked
-}
-
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch (error) {
-    return error.code === 'EPERM'
-  }
-}
-
-function isPlumbDaemon(pid) {
-  const ps = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
-  return ps.status === 0 && /\bplumb\b.*\bdaemon\b/.test(ps.stdout)
-}
-
 // -- throwaway environment ---------------------------------------------------------
 
 function buildDshHome({ root, fakeUrl, plumbSh, hoisted, idleMs, perAgent }) {
@@ -603,6 +603,9 @@ XDG_STATE_HOME='${xdg('.local/state')}'
 XDG_CACHE_HOME='${xdg('.cache')}'
 export XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
 unset TSM_ORIG_HOME TSM_ORIG_XDG_CONFIG_HOME TSM_ORIG_XDG_DATA_HOME TSM_ORIG_XDG_STATE_HOME TSM_ORIG_XDG_CACHE_HOME
+# On Linux a usable XDG_RUNTIME_DIR wins over HOME for the daemon's socket and
+# lock, which would put this daemon beside the user's real one.
+unset XDG_RUNTIME_DIR
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" \\
   "$HOME/Library/Caches" "$HOME/Library/Logs"
 exec '${plumbBin}' "$@"
@@ -716,21 +719,6 @@ async function pollFor(probe, timeoutMs) {
   }
 }
 
-function walkDirs(dir, depth) {
-  if (depth > 8) return []
-  const out = [dir]
-  let entries
-  try {
-    entries = fs.readdirSync(dir, { withFileTypes: true })
-  } catch {
-    return out
-  }
-  for (const entry of entries) {
-    if (entry.isDirectory()) out.push(...walkDirs(path.join(dir, entry.name), depth + 1))
-  }
-  return out
-}
-
 // -- process + path resolution helpers ----------------------------------------------
 
 /** Resolve the dsh launcher: DSH_BIN, else the profile tree dsh itself uses. */
@@ -780,16 +768,20 @@ function resolvePlumb() {
 
 /**
  * Run the dsh launcher to completion, streaming its output through with a
- * scenario prefix, and enforce the run timeout.
+ * scenario prefix, and enforce the run timeout. dsh runs in its own process
+ * group, recorded in `liveGroups`, so teardown can end it together with every
+ * `plumb serve` it started: a serve left running redials the daemon teardown
+ * stops and starts a new one.
  */
 function runDsh(harness, args, { cwd, env, timeoutMs }) {
   const [file, ...spawnArgs] = harness.argv(args)
   return new Promise((resolve) => {
-    const child = spawn(file, spawnArgs, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(file, spawnArgs, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true })
+    if (child.pid) liveGroups.add(child.pid)
     let timedOut = false
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGTERM')
+      try { process.kill(-child.pid, 'SIGTERM') } catch { /* already gone */ }
     }, timeoutMs)
     let stdout = ''
     let stderr = ''
