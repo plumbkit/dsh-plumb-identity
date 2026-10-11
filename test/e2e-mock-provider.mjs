@@ -309,6 +309,11 @@ async function noteWhileConnectedThenReconnect({ root, workspace, plumbSh, idleM
   gate.sessionId = connected.id
   gate.marker = `plan510-connected-note-${process.pid}-${Date.now()}`
   await sendNote({ workspace, plumbSh, to: connected.name, body: gate.marker })
+  // The premise: the note went out while the session was live. A send that
+  // outlasted the idle close would test a note to an ended session instead.
+  if (agentRecords({ root }).some((r) => r.id === connected.id && r.ended)) {
+    throw new Error(`session ${connected.id} had already ended when the note was sent; raise the scenario's idleMs`)
+  }
   console.log(`  gate: sent a note to ${connected.name} (session ${connected.id}) while it is connected`)
   const ended = await pollFor(() => agentRecords({ root }).find((r) => r.id === connected.id && r.ended), idleMs + DECLARE_TIMEOUT_MS)
   if (!ended) throw new Error(`the agent's connection never idle-closed (session ${connected.id} has no end after ${idleMs + DECLARE_TIMEOUT_MS} ms)`)

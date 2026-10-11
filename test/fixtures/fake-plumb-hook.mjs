@@ -5,7 +5,9 @@
 //
 //   proof     (default) the stamp under plumb_agent, plus a proof
 //   legacy    the stamp under the older _meta-named key, plus a proof
-//   silent    nothing on stdout (a daemon that takes no proof), a reason on stderr
+//   noproof   the stamp but no proof (what the real hook writes for a daemon
+//             that takes no proof)
+//   silent    nothing on stdout (no daemon answered), a reason on stderr
 //   mismatch  a proof for a different session id
 //   stall     never answers
 //
@@ -34,8 +36,11 @@ process.stdin.on('end', () => {
     case 'legacy':
       answer({ ...event.tool_input, session_id: id, 'dev.plumbkit/logical-agent': id, plumb_hook_proof: `proof-of-${id}` })
       break
+    case 'noproof':
+      answer({ ...event.tool_input, session_id: id, plumb_agent: id })
+      break
     case 'silent':
-      process.stderr.write('plumb identity hook: left the call unstamped: reason=fake daemon takes no proof\n')
+      process.stderr.write('plumb identity hook: left the call unstamped: reason=fake: no daemon answered\n')
       break
     case 'mismatch':
       answer({ session_id: 'someone-else', plumb_agent: 'someone-else', plumb_hook_proof: 'proof-of-someone-else' })

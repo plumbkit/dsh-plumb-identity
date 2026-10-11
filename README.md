@@ -145,8 +145,10 @@ confused for each other.
 - `idleMs` (default 15 s) closes a connection that has gone unused. It is also
   the only teardown DSH performs: its headless path never disposes plugins, so
   without an idle close the host process outlives the run that finished.
-- `resumeProof` (default `true`) keeps a reconnecting agent on the SAME plumb
-  session, so mail bound to it survives the idle close (below).
+- `resumeProof` (default `true`) lets a reconnect after an idle close resume
+  the agent's SAME plumb session, so mail bound to it survives (below).
+- `resumeProofTimeoutMs` (default 5 s) bounds the hook that computes the proof;
+  a value that is not a positive number falls back to the default.
 - `PLUMB_IDENTITY_DEBUG=1` traces the connection lifecycle to stderr.
 
 ### Reconnects keep the plumb session (resume proof)
@@ -167,8 +169,17 @@ per-agent connect the plugin runs plumb's own identity hook,
 `plumb hooks run-claude` (the command Claude Code runs before each plumb call),
 for the agent's id, and adds exactly two fields from its answer to the
 declaration: the stamp and the proof. The key, its location, its creation, and
-whether the running daemon takes a proof all stay plumb's business. The proof
-is not weakened: the serve still verifies it against the key.
+whether the running daemon takes a proof all stay plumb's business; the plugin
+depends only on names (the hook verb, its input/output shape, the
+`mcp__plumb__` prefix, the stamp and proof argument keys), and a renamed one
+makes it fail open, not misbehave. The proof is not weakened: the serve still
+verifies it against the key.
+
+plumb resumes a session whose previous connection has ENDED. The idle close
+ends it before the agent's next call can open another, so the ordinary
+reconnect resumes (the `reconnect` e2e waits for plumb to record that end
+before the model's next call). A connection opened while the old one is still
+live is not resumed and gets a new session, as before.
 
 It fails open. If the hook gives no proof (a plumb that predates it, a daemon
 that does not take it, no answer within `resumeProofTimeoutMs`, default 5 s),

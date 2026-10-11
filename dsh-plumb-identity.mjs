@@ -67,8 +67,9 @@
 // for, it spawns its OWN `plumb serve` child, declares that agent on it, and
 // dispatches the call over that connection instead of the shared one. The
 // connection IS the identity — no `_meta` stamping, no shared-connection gate,
-// no pin collisions, no cross-agent writes, and nothing to keep in sync with
-// plumb's identity internals.
+// no pin collisions, no cross-agent writes, and no per-call stamp to keep in
+// step with plumb's identity layer. (The one thing it does share with plumb is
+// the resume proof's argument names, below.)
 //
 // Two rules keep it strictly better than the shared path:
 //
@@ -260,12 +261,23 @@ export function refusesMailPreview (result) {
 // The proof is not computed here. plumb's own identity hook computes it
 // (`plumb hooks run-claude`, the command Claude Code runs before every plumb
 // call), so the key's location, its creation, the stamp key the running daemon
-// takes, and whether that daemon accepts a proof at all stay plumb's business,
-// and this plugin keeps nothing of plumb's identity internals in sync. The
-// plugin hands the hook a session_start naming the agent and keeps exactly two
-// things from its answer: the stamp, and the proof. Nothing is weakened: the
-// serve still verifies the proof against the key, and the plugin only asks for
-// a proof of the id it already declares.
+// takes, and whether that daemon accepts a proof at all stay plumb's business.
+// What this plugin does depend on is names, not key handling: the hook verb,
+// its PreToolUse input and output shape, the `mcp__plumb__` tool prefix, and
+// the stamp and proof argument keys, each cited to plumb's source where it is
+// defined. If plumb renames one, the proof is simply not found, and the plugin
+// fails open to the name-only resume and says so. The plugin hands the hook a
+// session_start naming the agent and keeps exactly two things from its answer:
+// the stamp, and the proof. Nothing is weakened: the serve still verifies the
+// proof against the key, and the plugin only asks for a proof of the id it
+// already declares.
+//
+// What it buys, and its limit: plumb resumes a session whose previous
+// connection has ENDED. An idle close ends it before the agent's next call can
+// open another, so the ordinary reconnect resumes. A connection opened while
+// the old one is somehow still live is not resumed (plumb's
+// docs/identity-resume-credential-design.md), and falls back to a new session,
+// as before this change.
 
 /** The plumb subcommand that computes the proof: plumb's identity hook. */
 export const resumeProofArgs = ['hooks', 'run-claude']
@@ -297,9 +309,10 @@ export function resumeProofRequest (id) {
 /**
  * The arguments to add to a declaration of `id`, read from the hook's stdout:
  * `{ <stamp key>: id, plumb_hook_proof: <proof> }`, or null when the answer
- * carries no proof for exactly this id. The hook stays silent when the daemon
- * does not take a proof (or no daemon answered), and that is null too: the
- * declaration then goes out as it always did.
+ * carries no proof for exactly this id. When the daemon does not take a proof
+ * the hook still stamps but adds none, and when no daemon answers it writes
+ * nothing; both are null too, and the declaration then goes out as it always
+ * did.
  */
 export function resumeProofFields (id, stdout) {
   let updated
@@ -366,6 +379,8 @@ export function runResumeProof (command, id, env, timeoutMs) {
     timer.unref?.()
     child.stdout.on('data', (chunk) => { stdout += chunk })
     child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.stdout.on('error', () => {})
+    child.stderr.on('error', () => {})
     child.on('error', (error) => settle(`could not run ${command}: ${String(error).slice(0, 160)}`))
     child.on('close', () => settle(null))
     // A child that exits before reading its stdin must not become an
@@ -722,7 +737,12 @@ export async function apply (ctx, config) {
    */
   async function resumeProofFor (ident) {
     if (cfg.resumeProof !== true) return {}
-    const { fields, why } = await runResumeProof(resolvePlumbCommand(cfg, process.env), ident.id, resumeProofEnv(process.env), cfg.resumeProofTimeoutMs)
+    // A timeout that is not a positive number would kill the hook before it
+    // could answer, silently dropping every proof: fall back to the default.
+    const timeoutMs = Number.isFinite(cfg.resumeProofTimeoutMs) && cfg.resumeProofTimeoutMs > 0
+      ? cfg.resumeProofTimeoutMs
+      : defaultConfig().resumeProofTimeoutMs
+    const { fields, why } = await runResumeProof(resolvePlumbCommand(cfg, process.env), ident.id, resumeProofEnv(process.env), timeoutMs)
     debug('resume proof', ident.id, fields === null ? `none: ${why}` : 'attached')
     if (fields !== null) return fields
     if (!resumeProofWarned) {

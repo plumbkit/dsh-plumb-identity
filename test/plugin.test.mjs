@@ -974,7 +974,11 @@ test('runResumeProof runs plumb hooks run-claude and returns its proof', async (
 test('runResumeProof fails open: silence, a stall and a missing binary each give no proof and a reason', async () => {
   const silent = await runResumeProof(fakeHook, 'id', { ...process.env, FAKE_PLUMB_HOOK: 'silent' }, 5_000)
   assert.equal(silent.fields, null)
-  assert.match(silent.why, /fake daemon takes no proof/, "the hook's own reason is reported")
+  assert.match(silent.why, /fake: no daemon answered/, "the hook's own reason is reported")
+
+  const stampedOnly = await runResumeProof(fakeHook, 'id', { ...process.env, FAKE_PLUMB_HOOK: 'noproof' }, 5_000)
+  assert.equal(stampedOnly.fields, null, 'a stamp with no proof is not taken')
+  assert.equal(stampedOnly.why, 'the hook returned no proof')
 
   const mismatch = await runResumeProof(fakeHook, 'id', { ...process.env, FAKE_PLUMB_HOOK: 'mismatch' }, 5_000)
   assert.equal(mismatch.fields, null)
@@ -993,7 +997,8 @@ test('runResumeProof fails open: silence, a stall and a missing binary each give
 test('per-agent connection: with no proof the declaration goes out unproved, warned once per process', async () => {
   process.env.DSH_HOME = fixtureDshHome
   resetFixture()
-  await withEnv({ FAKE_PLUMB_HOOK: 'silent' }, async () => {
+  // The real hook's answer for a daemon that takes no proof: stamped, unproved.
+  await withEnv({ FAKE_PLUMB_HOOK: 'noproof' }, async () => {
     const ctx = stubCtx()
     await mountPerAgent(ctx)
     try {
@@ -1009,11 +1014,27 @@ test('per-agent connection: with no proof the declaration goes out unproved, war
       }
       const warned = ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('no resume proof'))
       assert.equal(warned.length, 1, 'once per process, not once per connection')
-      assert.match(warned[0][1], /fake daemon takes no proof/)
+      assert.match(warned[0][1], /the hook returned no proof/)
     } finally {
       await ctx.handlers.dispose?.()
     }
   })
+})
+
+test('per-agent connection: a resumeProofTimeoutMs that is not a positive number falls back to the default', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  for (const bad of [0, -1, Number.NaN, 'soon']) {
+    resetFixture()
+    const ctx = stubCtx()
+    await mountPerAgent(ctx, { resumeProofTimeoutMs: bad })
+    try {
+      await ctx.handlers['tools/execute']({ name: 'mcp__plumb__read_file', arguments: {}, ...conversation(`conv-to-${String(bad)}`, '/w/to') }, async () => 'shared')
+      const declare = toolCalls.find((call) => call.name === 'session_start')
+      assert.equal(typeof declare.arguments.plumb_hook_proof, 'string', `timeout ${String(bad)} still lets the hook answer`)
+    } finally {
+      await ctx.handlers.dispose?.()
+    }
+  }
 })
 
 test('per-agent connection: resumeProof false never runs the hook', async () => {
