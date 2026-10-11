@@ -643,6 +643,14 @@ function readSessionRecords({ root }) {
     if (path.basename(dir) !== 'sessions') continue
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       if (!entry.isFile()) continue
+      // plumb writes a session record through an atomic temp file in this same
+      // directory (TempPattern ".session-*.json.tmp", internal/session). Its
+      // own readers match *.json; this one used to read every regular file, so
+      // a complete, fsynced temp file caught before its rename parsed as a
+      // duplicate record — which failed `per-agent` intermittently and, worse,
+      // could satisfy the "two own connections" control below with ONE
+      // connection. Found by morning-moose's round-2 review.
+      if (!entry.name.endsWith('.json') || entry.name.startsWith('.')) continue
       const file = path.join(dir, entry.name)
       const text = fs.readFileSync(file, 'utf8')
       let record = null
