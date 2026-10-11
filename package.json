@@ -1,6 +1,6 @@
 {
   "name": "dsh-plumb-identity",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Per-agent plumb session identity for DeepSeek Harness: stamps and declares a stable plumb session id for every DSH conversation and subagent sharing one plumb MCP connection.",
   "license": "MIT",
   "type": "module",
@@ -16,6 +16,9 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "scripts": {
     "test": "node --test test/plugin.test.mjs test/isolated-daemon.test.mjs",

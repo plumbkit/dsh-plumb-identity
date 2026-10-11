@@ -96,6 +96,9 @@
 import { homedir } from 'node:os'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 /** Stable cordis plugin name (loader diagnostics, HMR swap, patch overrides). */
 export const name = 'dsh-plumb-identity'
@@ -509,13 +512,73 @@ export function shouldSkip (config, env) {
 // here first. Failure to import is survivable (fail open, stamp nothing), so
 // the awaited imports swallow their errors.
 
-function defaultSdkRoot () {
+const SDK_PACKAGE = '@modelcontextprotocol/sdk'
+
+/**
+ * Walk up from `startDir` looking for an installed copy of the v1 SDK, and
+ * return its `dist/esm` root, or null. Exported for tests.
+ *
+ * By path rather than `require.resolve`, deliberately: resolving the package
+ * would depend on the SDK's `exports` map exposing this subpath, and a future
+ * version that narrowed it would break resolution for a reason that has nothing
+ * to do with where the files are. `existsSync` asks the only question that
+ * matters — is the module that gets imported actually there.
+ *
+ * It accepts an install in ANY ancestor's `node_modules`, which is what Node
+ * itself would do for a bare specifier imported from this directory — a checkout
+ * nested inside another package is a layout Node accepts too.
+ */
+export function findOwnSdkRoot (startDir) {
+  try {
+    let dir = startDir
+    for (;;) {
+      const candidate = join(dir, 'node_modules', SDK_PACKAGE, 'dist', 'esm')
+      if (existsSync(join(candidate, 'client', 'index.js'))) return candidate
+      const parent = dirname(dir)
+      if (parent === dir) return null
+      dir = parent
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The shared profile tree DSH 0.1.x maintained for plugins. Kept as the
+ * fallback, not the primary: DSH 0.2.0 no longer populates it (its
+ * `healProfilesModuleFallback` is gone) and ships `@modelcontextprotocol/client`
+ * v2 rather than the v1 SDK patched below, so an install that still resolves
+ * here is resolving through a link nothing maintains — which is how identity
+ * went silently absent on 2026-10-11 after a disk cleanup removed the target.
+ */
+function profileSdkRoot () {
   // Match dsh's own home resolution: an explicit $DSH_HOME IS the dsh home
   // root; only the default gets the `.dsh` suffix (`~/.dsh`). Appending `.dsh`
   // unconditionally made the SDK unimportable — and identity silently absent —
   // whenever DSH_HOME pointed at a custom home.
   const home = process.env.DSH_HOME ?? `${homedir()}/.dsh`
-  return `${home}/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm`
+  return `${home}/profiles/node_modules/${SDK_PACKAGE}/dist/esm`
+}
+
+/**
+ * The SDK root to import from: the plugin's OWN installed copy first, the shared
+ * profile tree second. A `link:`ed plugin resolves its dependencies from its real
+ * directory, so a local install is what makes this plugin independent of a tree
+ * DSH stopped maintaining.
+ *
+ * `pluginDir` is a parameter so the preference itself is testable — the default
+ * is this module's own directory, which a test cannot move.
+ */
+export function defaultSdkRoot (pluginDir = fileURLToPath(new URL('.', import.meta.url))) {
+  return findOwnSdkRoot(pluginDir) ?? profileSdkRoot()
+}
+
+/** Both locations, for the warnings that have to name what they tried. */
+export function sdkRoots () {
+  return {
+    own: findOwnSdkRoot(fileURLToPath(new URL('.', import.meta.url))),
+    profile: profileSdkRoot()
+  }
 }
 
 const moduleSdk = await import(`${defaultSdkRoot()}/client/index.js`).catch(() => null)
@@ -587,7 +650,10 @@ export async function apply (ctx, config) {
     ? null
     : moduleSchema
   if (sdk === null) {
-    ctx.logger?.warn?.(`${name}: MCP SDK not importable; falling back to the AGENTS.md instruction surface — calls will go out unstamped`)
+    const roots = sdkRoots()
+    ctx.logger?.warn?.(`${name}: MCP SDK not importable from ${sdkSource}; falling back to the AGENTS.md instruction surface — calls will go out unstamped. ` +
+      `Tried the plugin's own copy (${roots.own ?? 'not installed'}) and the shared profile tree (${roots.profile}). ` +
+      'Run `npm install` in the plugin directory to install its own copy.')
   }
   if (sdk?.Client?.prototype?.request !== undefined) {
     const proto = sdk.Client.prototype
@@ -832,7 +898,19 @@ export async function apply (ctx, config) {
   function noteCapabilityGap () {
     if (capabilityNoted) return
     capabilityNoted = true
-    ctx.logger?.info?.(`${name}: per-agent connections unavailable (MCP client/stdio transport not importable); plumb calls use the shared connection`)
+    // A WARNING, not the info line this used to be (2026-10-11, from the ~/.dsh
+    // SDK-link investigation rather than a card). The earlier judgement — "a
+    // capability gap rather than a fault" — was made before the gap was observed
+    // in the wild: an SDK link removed by a disk cleanup dropped a DSH process back
+    // to the SHARED connection, where its calls go UNATTRIBUTED, which is the
+    // PLAN-510 configuration. It failed open, so nothing looked broken, and the
+    // info line it emitted was invisible in a normal run. A consequence that costs
+    // an afternoon of misdiagnosis is worth a warning; it stays one-time because
+    // the gap is a property of the process, not of the call.
+    const roots = sdkRoots()
+    ctx.logger?.warn?.(`${name}: per-agent connections unavailable (MCP client/stdio transport not importable) — plumb calls use the SHARED connection UNATTRIBUTED: nothing is stamped, because the SDK that carries the stamp is the one that could not be imported, so plumb refuses their state-changing calls (the PLAN-510 configuration). ` +
+      `Tried the plugin's own copy (${roots.own ?? 'not installed'}) and the shared profile tree (${roots.profile}). ` +
+      'Run `npm install` in the plugin directory to install its own copy.')
   }
 
   function closeEntry (entry) {
@@ -889,8 +967,9 @@ export async function apply (ctx, config) {
    * Keep the registry bounded; close the least recently used excess. A busy entry
    * is never a candidate, so the registry can sit ABOVE `maxConnections` while
    * every entry has a call in flight — the correct failure mode: closing under a
-   * call is the bug this exists to avoid (PLAN-516), and the excess is retired as
-   * each call settles.
+   * call is the bug this exists to avoid (PLAN-516). An over-cap entry is retired
+   * when its idle timer fires, or at the next new connection's cleanup — NOT the
+   * moment its call settles, which only re-arms that timer.
    */
   function evictConnections () {
     if (connections.size <= cfg.maxConnections) return

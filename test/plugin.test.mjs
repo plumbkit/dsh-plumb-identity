@@ -4,8 +4,10 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { join } from 'node:path'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 
 const here = 'test'
 const pluginUrl = new URL('../dsh-plumb-identity.mjs', import.meta.url)
@@ -15,7 +17,7 @@ const fixtureSdkUrl = new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@mo
 const {
   name, inject, defaultConfig, resolveAgentContext, mintIdentity, shouldSkip, apply, resolvePlumbCommand, mcpContentText, refusesMailPreview,
   resumeProofArgs, resumeProofRequest, resumeProofFields, resumeProofEnv, runResumeProof,
-  normaliseSessionStart
+  normaliseSessionStart, findOwnSdkRoot, defaultSdkRoot
 } = await import(pluginUrl)
 const { requests, toolCalls, clients, fixtureState, Client } = await import(fixtureSdkUrl)
 const { spawned, instances } = await import(new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js', import.meta.url).href)
@@ -1292,6 +1294,104 @@ test('fallback: the declaration is normalised but carries no proof', async () =>
     for (const call of declares) {
       assert.equal('plumb_hook_proof' in call.arguments, false, 'the plugin’s own fallback declaration is unproved by design')
     }
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+// -- SDK root resolution ----------------------------------------------------
+//
+// The rest of this suite always passes `sdkPath`, so the DEFAULT resolution — the
+// one a real DSH install actually uses — was never exercised by any test. That is
+// how the plugin came to depend on `~/.dsh/profiles/node_modules`, a tree DSH
+// 0.2.0 stopped maintaining: on 2026-10-11 a disk cleanup removed the link's
+// target and identity went silently absent, with every test still green.
+
+test('findOwnSdkRoot walks up to an installed copy, and reports null when there is none', () => {
+  const root = mkdtempSync(join(tmpdir(), 'plumb-sdk-'))
+  const esm = join(root, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm')
+  mkdirSync(join(esm, 'client'), { recursive: true })
+  writeFileSync(join(esm, 'client', 'index.js'), '// fixture\n')
+  const nested = join(root, 'packages', 'plugin')
+  mkdirSync(nested, { recursive: true })
+
+  assert.equal(findOwnSdkRoot(nested), esm, 'a nested plugin directory resolves its ancestor’s install')
+  assert.equal(findOwnSdkRoot(root), esm, 'the directory holding node_modules resolves too')
+
+  const bare = mkdtempSync(join(tmpdir(), 'plumb-sdk-bare-'))
+  assert.equal(findOwnSdkRoot(bare), null, 'no install anywhere up the tree reports null')
+
+  // A package directory that exists but does not contain the module must not
+  // count: the only question that matters is whether the file that gets imported
+  // is actually there, which is also why this walks paths instead of resolving
+  // the package (an `exports` map could refuse the subpath).
+  const hollow = mkdtempSync(join(tmpdir(), 'plumb-sdk-hollow-'))
+  mkdirSync(join(hollow, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm'), { recursive: true })
+  assert.equal(findOwnSdkRoot(hollow), null, 'an empty package directory does not count as installed')
+})
+
+test('defaultSdkRoot prefers the plugin’s own copy and falls back to the profile tree', () => {
+  const home = mkdtempSync(join(tmpdir(), 'plumb-home-'))
+  const profileEsm = join(home, 'profiles', 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm')
+  mkdirSync(join(profileEsm, 'client'), { recursive: true })
+  writeFileSync(join(profileEsm, 'client', 'index.js'), '// profile\n')
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  try {
+    const own = mkdtempSync(join(tmpdir(), 'plumb-own-'))
+    const ownEsm = join(own, 'node_modules', '@modelcontextprotocol', 'sdk', 'dist', 'esm')
+    mkdirSync(join(ownEsm, 'client'), { recursive: true })
+    writeFileSync(join(ownEsm, 'client', 'index.js'), '// own\n')
+    assert.equal(defaultSdkRoot(own), ownEsm, 'the plugin’s own install wins over a profile copy that also exists')
+
+    const bare = mkdtempSync(join(tmpdir(), 'plumb-bare-'))
+    assert.equal(defaultSdkRoot(bare), profileEsm, 'with no own install it falls back to the shared profile tree')
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+})
+
+// The capability gap is the state the 2026-10-11 incident was actually in: the
+// SDK carrying the stamp could not be imported, so nothing was stamped at all.
+// It is reported at WARN, once, naming both paths tried — and each half of that
+// sentence is load-bearing. Flipping the level to `info` used to leave every test
+// green, and the wording used to claim identity was "stamped rather than owned",
+// which is false of a process whose stamp patch never installed. Both are pinned
+// here because the message exists to diagnose exactly this failure.
+test('the per-agent capability gap warns ONCE, at WARN, naming both paths tried', async () => {
+  // A stub client module whose sibling stdio.js does not exist: the client
+  // imports and the transport cannot, which is the gap.
+  const dir = mkdtempSync(join(tmpdir(), 'plumb-gap-'))
+  const stub = join(dir, 'index.js')
+  writeFileSync(stub, 'export class Client {}\n')
+  process.env.DSH_HOME = join(dir, 'empty-home')
+
+  const ctx = stubCtx()
+  // A URL, as the other mounts pass the fixture SDK: the plugin derives the sibling
+  // stdio.js with `new URL('./stdio.js', sdkPath)`, which a bare path cannot base.
+  await apply(ctx, { sdkPath: pathToFileURL(stub).href, perAgentConnection: true, plumbCommand: fakeHook })
+  try {
+    const run = (id) => ctx.handlers['tools/execute'](
+      { name: 'mcp__plumb__read_file', arguments: { path: 'x.go' }, ...conversation(id, '/w/gap') },
+      async () => 'shared'
+    )
+    await run('conv-gap-1')
+    await run('conv-gap-2') // a second agent must not produce a second warning
+
+    const gaps = ctx.logs.filter(([, msg]) => msg.includes('per-agent connections unavailable'))
+    assert.equal(gaps.length, 1, `the gap warns exactly once, not per call: ${JSON.stringify(gaps)}`)
+    assert.equal(gaps[0][0], 'warn', 'it is a WARNING: the consequence is the PLAN-510 configuration, not a footnote')
+    const msg = gaps[0][1]
+    assert.match(msg, /SHARED connection/, 'it says which connection the calls take')
+    assert.match(msg, /nothing is stamped/,
+      'and that NOTHING is stamped — the SDK carrying the stamp is the one that could not be imported')
+    assert.match(msg, /profiles\/node_modules\/@modelcontextprotocol\/sdk/, 'it names the profile path it tried')
+    // Loose on purpose: whether an own copy exists depends on the ancestors of this
+    // checkout (a worktree under an installed tree finds one), and the resolution
+    // accepting an ancestor is Node's own behaviour. What must hold either way is
+    // that BOTH attempts are reported.
+    assert.match(msg, /own copy \(/, 'and the plugin-local copy it tried first')
   } finally {
     await ctx.handlers.dispose?.()
   }
