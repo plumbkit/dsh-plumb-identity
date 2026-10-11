@@ -113,15 +113,16 @@ npm run test:e2e
 
 Verifies the full chain — real DSH agent loop, this plugin mounted from the working tree, real plumb — with only the MODEL scripted (`test/fake-model.mjs`, a local OpenAI-compatible server), so it spends **zero LLM credits** and touches no network beyond localhost. Each scenario runs in a throwaway `DSH_HOME` whose only configured provider is the local fake (a misrouted model request fails on "unknown provider" rather than billing a real key) against an isolated `plumb serve` whose `HOME`/`XDG` roots live under the scenario's temp dir — neither your DSH profile nor your plumb state is touched.
 
-Five scenarios:
+Six scenarios:
 
 - `tool-call` — one plumb tool call; a session with `purpose: dsh` and `external_id: dsh-*` must be declared.
 - `text-only` — no plumb tool call; nothing may be declared (the control).
 - `subagent` — the agent delegates a subagent that makes the plumb call; a `purpose: dsh-subagent` identity must be declared.
 - `per-agent` — the agent and a subagent both call plumb; each must get its own connection, declared on itself, and the shared connection must carry no declaration.
 - `mail` — a note is left for "whoever attaches next" before the agent's first plumb call; the model must receive it from `check_messages` exactly once. This is the regression test for the automatic `session_start` consuming mail. Remove `mail: "preview"` from the plugin and it fails with "claimed where the model cannot see it".
+- `reconnect` — a note is sent to the agent WHILE it is connected, its own connection then idle-closes (an 8 s `idleMs`; the fake model is held between its two calls until plumb records the end), and the model's `check_messages` runs over a new connection. The note must arrive exactly once and the agent's declared session id must not change. The red control is `E2E_RESUME_PROOF=0 node test/e2e-mock-provider.mjs --mode reconnect`, which mounts the plugin with `resumeProof: false` and must FAIL with the note "stranded on session …" and a second session id.
 
-The first four assert on plumb's own session records; `mail` asserts on the tool results the fake model was actually sent. Every scenario stops its own isolated plumb daemon on the way out, found by the pidfile under its temp `HOME` (never a process-wide sweep), on pass and on fail. A daemon that survives fails the scenario.
+The first four assert on plumb's own session records; `mail` asserts on the tool results the fake model was actually sent, and `reconnect` on both. Every scenario stops its own isolated plumb daemon on the way out, found by the pidfile under its temp `HOME` (never a process-wide sweep), on pass and on fail. A daemon that survives fails the scenario.
 
 Requirements: a `dsh` install (resolved from `$DSH_BIN`, else the `$DSH_HOME` / `~/.dsh` profile tree, exactly what dsh itself resolves) and a plumb binary (`$PLUMB_BIN`, else `../plumb/plumb` beside this checkout, else `plumb` on PATH). Run one scenario with `node test/e2e-mock-provider.mjs --mode subagent`; keep the temp dirs for debugging with `--keep` or `E2E_KEEP=1`.
 
@@ -144,7 +145,38 @@ confused for each other.
 - `idleMs` (default 15 s) closes a connection that has gone unused. It is also
   the only teardown DSH performs: its headless path never disposes plugins, so
   without an idle close the host process outlives the run that finished.
+- `resumeProof` (default `true`) keeps a reconnecting agent on the SAME plumb
+  session, so mail bound to it survives the idle close (below).
 - `PLUMB_IDENTITY_DEBUG=1` traces the connection lifecycle to stderr.
+
+### Reconnects keep the plumb session (resume proof)
+
+Every idle close means the agent's next plumb call opens a new `plumb serve`,
+and plumb gives a new connection a new session id unless the serve can resume
+the old one. Before 0.3.0 it could not: the agent kept its plumb NAME, got a
+new session id on every reconnect (17 in 96 minutes, measured), and a note
+bound to the old id while it was connected was left to expire unread.
+
+plumb already has the mechanism: a serve keeps a resume credential per
+conversation and presents it when a replacement serve names the same
+conversation, and the daemon restores the session, its id, its threads and its
+mail. It presents only for a conversation the user's own tooling provably
+named: the `session_start` carries the identity stamp and `plumb_hook_proof`,
+an HMAC of the stamp under a per-user key the model never sees. So on every
+per-agent connect the plugin runs plumb's own identity hook,
+`plumb hooks run-claude` (the command Claude Code runs before each plumb call),
+for the agent's id, and adds exactly two fields from its answer to the
+declaration: the stamp and the proof. The key, its location, its creation, and
+whether the running daemon takes a proof all stay plumb's business. The proof
+is not weakened: the serve still verifies it against the key.
+
+It fails open. If the hook gives no proof (a plumb that predates it, a daemon
+that does not take it, no answer within `resumeProofTimeoutMs`, default 5 s),
+the declaration goes out as before and the plugin warns once per process that
+reconnects resume by name only. `PLUMB_IDENTITY_HOOK=off`, Claude Code's switch
+for that hook, is not passed to it: here it is asked for a proof, not to stamp
+a model's call. The shared-connection fallback never sends a proof: one serve
+carries many agents there, and its credential is not any one agent's.
 
 ## Interplay notes
 

@@ -20,6 +20,11 @@
 //     check_messages, then answers "done". Every tool result the model is sent
 //     is recorded in `toolResults`, so the harness can assert what the model
 //     actually saw.
+//   - `reconnect` — the `mail` steps, but the reply that would call
+//     check_messages is held until the harness's `beforeCheckMessages` resolves.
+//     The harness uses the pause to send a note to the connected agent and wait
+//     for its plumb connection to idle-close, so check_messages runs over a
+//     NEW connection (PLAN-510).
 //
 // The tool to call is read from the request's own `tools[]` (matched by name
 // shape, never hardcoded), and arguments are filled generically from the
@@ -39,18 +44,18 @@ const FINAL_TEXT = 'done'
 /** Plausible non-zero usage: dsh's token meter reads these fields. */
 const USAGE = { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 }
 
-export const FAKE_MODEL_MODES = ['tool-call', 'text-only', 'subagent', 'per-agent', 'mail']
+export const FAKE_MODEL_MODES = ['tool-call', 'text-only', 'subagent', 'per-agent', 'mail', 'reconnect']
 
 /**
  * Start the fake model on an ephemeral 127.0.0.1 port.
- * @param {{mode?: string, log?: (line: string) => void}} options
+ * @param {{mode?: string, log?: (line: string) => void, beforeCheckMessages?: () => Promise<void>}} options
  * @returns {Promise<{url: string, port: number, requests: string[], close: () => Promise<void>}>}
  */
-export function createFakeModel({ mode = 'tool-call', log = () => {} } = {}) {
+export function createFakeModel({ mode = 'tool-call', log = () => {}, beforeCheckMessages } = {}) {
   if (!FAKE_MODEL_MODES.includes(mode)) {
     throw new Error(`fake-model: unknown mode "${mode}" (expected one of ${FAKE_MODEL_MODES.join(', ')})`)
   }
-  const state = { spawns: 0, requests: [], toolResults: [], seenToolResults: new Set() }
+  const state = { spawns: 0, requests: [], toolResults: [], seenToolResults: new Set(), beforeCheckMessages, gated: null }
   const server = http.createServer((req, res) => {
     collectBody(req)
       .then((body) => route(req, res, body, mode, state, log))
@@ -100,6 +105,15 @@ function route(req, res, body, mode, state, log) {
   state.requests.push(line)
   recordToolResults(parsed, state)
   log(`fake-model <- ${line}`)
+  // `reconnect`: hold the check_messages reply, once, until the harness is
+  // done with the connected agent. Every request that would make that call
+  // waits on the same gate, so a retried request cannot slip past it.
+  if (mode === 'reconnect' && state.beforeCheckMessages && decide(parsed, mode, state).id === 'call_e2e_mail') {
+    state.gated ??= Promise.resolve().then(state.beforeCheckMessages)
+    return state.gated
+      .then(() => respond(res, parsed, mode, state))
+      .catch((error) => sendJson(res, 500, { error: { message: `fake-model: the harness gate failed: ${error.message}` } }))
+  }
   return respond(res, parsed, mode, state)
 }
 
@@ -124,7 +138,7 @@ function decide(parsed, mode, state) {
   const hasToolResult = messages.some((message) => message.role === 'tool')
   // `mail` decides by which tools the conversation has already called, so the
   // tool-result short-circuit below must not apply to it.
-  if (mode === 'mail') return decideMail(parsed, messages)
+  if (mode === 'mail' || mode === 'reconnect') return decideMail(parsed, messages)
   // `per-agent` decides on BOTH request shapes — the opening turn calls plumb,
   // the follow-up delegates — so it must not be short-circuited here.
   if (mode === 'text-only' || (hasToolResult && mode !== 'per-agent')) return { kind: 'text' }

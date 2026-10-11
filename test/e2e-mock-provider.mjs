@@ -133,6 +133,48 @@ const SCENARIOS = {
       return null
     },
   },
+  // PLAN-510. A note sent to the agent WHILE it is connected is bound to its
+  // current plumb session. The agent's own connection then idle-closes, and its
+  // next plumb call opens a new one. Before the resume proof, plumb gave the new
+  // connection a NEW session id under the same name, and the note stayed bound
+  // to the old id: stranded, never delivered. With the proof, the new
+  // connection resumes the same session and check_messages delivers the note,
+  // exactly once. The model is held between its two calls (fake-model's
+  // `reconnect` mode) while the harness sends the note and waits for plumb to
+  // record the connection's end, so the reconnect is observed, not assumed.
+  // Control: E2E_RESUME_PROOF=0 mounts the plugin with `resumeProof: false`,
+  // and this scenario must FAIL.
+  reconnect: {
+    task: 'Use the mcp__plumb__daemon_info tool once, then the mcp__plumb__check_messages tool once, then reply with exactly: done',
+    // Long enough that the note is sent well inside the connected window (the
+    // gate opens as the first call returns), short enough to keep the run quick.
+    idleMs: 8_000,
+    gate: noteWhileConnectedThenReconnect,
+    expect: async ({ root, fake, gate }) => {
+      if (gate.error) return `the reconnect was never staged: ${gate.error}`
+      if (!gate.ended) return 'the gate never ran, so no reconnect was staged'
+      // The positive control: check_messages went over a SECOND connection.
+      // Each connection leaves a record, resumed or not, so one is a run in
+      // which nothing reconnected and the rest of this proves nothing.
+      const connections = readSessionRecords({ root }).filter((r) => r.clientName === 'dsh-plumb-identity')
+      if (connections.length < 2) return `expected the agent to reconnect (two own connections), found ${connections.length}`
+      const results = fake.toolResults
+      if (!results.some((r) => /check_messages$/.test(r.name ?? ''))) {
+        return `the model never received a check_messages result (tool results: ${results.map((r) => r.name).join(', ') || 'none'})`
+      }
+      const hits = results.flatMap((r) => Array(r.content.split(gate.marker).length - 1).fill(r.name))
+      const ids = [...new Set(agentRecords({ root }).map((r) => r.id))]
+      if (hits.length === 0) {
+        return `the note sent while the agent was connected never reached it after the reconnect: stranded on session ${gate.sessionId} (agent session ids seen: ${ids.join(', ')})`
+      }
+      if (hits.length > 1) return `the note reached the model ${hits.length} times (${hits.join(', ')}), expected exactly once`
+      if (!/check_messages$/.test(hits[0] ?? '')) return `the note reached the model through ${hits[0]}, not check_messages`
+      if (ids.length !== 1 || ids[0] !== gate.sessionId) {
+        return `the agent's plumb session id changed across the reconnect: ${gate.sessionId} -> ${ids.join(', ')}`
+      }
+      return null
+    },
+  },
 }
 
 main().catch((error) => {
@@ -173,14 +215,29 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
   const root = fs.mkdtempSync(path.join(parent, `dsh-identity-e2e-${mode}-`))
   let fake
   let passed = false
+  const scenario = SCENARIOS[mode]
+  // What the scenario's gate did, for its expect (see fake-model's `reconnect`).
+  const gate = {}
+  let runGate = null
   console.log(`\n=== ${mode} ===`)
   try {
-    fake = await createFakeModel({ mode, log: (line) => console.log(`  ${line}`) })
+    fake = await createFakeModel({
+      mode,
+      log: (line) => console.log(`  ${line}`),
+      beforeCheckMessages: scenario.gate ? () => runGate() : undefined,
+    })
     const plumbSh = writePlumbWrapper({ root, plumbBin })
-    const home = buildDshHome({ root, fakeUrl: fake.url, plumbSh, hoisted: harness.hoisted })
+    const idleMs = scenario.idleMs ?? Number(process.env.E2E_IDLE_MS ?? 60000)
+    const home = buildDshHome({ root, fakeUrl: fake.url, plumbSh, hoisted: harness.hoisted, idleMs })
     const workspace = path.join(root, 'workspace')
     fs.mkdirSync(workspace, { recursive: true })
-    const setup = SCENARIOS[mode].setup ? await SCENARIOS[mode].setup({ workspace, plumbSh }) : {}
+    const setup = scenario.setup ? await scenario.setup({ workspace, plumbSh }) : {}
+    if (scenario.gate) {
+      runGate = () => scenario.gate({ root, workspace, plumbSh, idleMs, gate }).catch((error) => {
+        gate.error = error.message
+        throw error
+      })
+    }
 
     const run = await runDsh(harness, ['--profile', 'e2e', task], {
       cwd: workspace,
@@ -202,7 +259,7 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
     if (run.timedOut) console.error(`  dsh timed out after ${RUN_TIMEOUT_MS}ms`)
     console.log(`  dsh exit=${run.code}${run.timedOut ? ' (timed out)' : ''}`)
 
-    const problem = await SCENARIOS[mode].expect({ root, fake, setup })
+    const problem = await scenario.expect({ root, fake, setup, gate })
     if (problem === null) {
       console.log(`  PASS ${mode}`)
       passed = true
@@ -229,13 +286,42 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
 }
 
 /**
- * Leave a note for whoever attaches to `workspace` next, from a short-lived
- * plumb session of its own (plumb's CLI cannot send mail). Speaks MCP's stdio
- * framing directly, one JSON-RPC message per line, so the harness needs no SDK.
+ * Leave a note for whoever attaches to `workspace` next (PLAN-500's setup).
  * Returns the note's unique marker.
  */
 async function fileWaitingNote({ workspace, plumbSh }) {
   const marker = `plan500-waiting-note-${process.pid}-${Date.now()}`
+  await sendNote({ workspace, plumbSh, to: 'next', body: marker })
+  console.log(`  setup: left a note for the next session (${marker})`)
+  return { marker }
+}
+
+/**
+ * PLAN-510's gate, run while the model is held between daemon_info and
+ * check_messages: find the agent's own plumb session, send it a note while it
+ * is connected (so the note is bound to that session), then wait until plumb
+ * records the connection's end, which is the idle close. Releasing the gate
+ * then makes the model's check_messages open a NEW connection.
+ */
+async function noteWhileConnectedThenReconnect({ root, workspace, plumbSh, idleMs, gate }) {
+  const connected = await pollFor(() => agentRecords({ root }).find((r) => !r.ended), DECLARE_TIMEOUT_MS)
+  if (!connected) throw new Error('the agent never opened its own plumb connection')
+  gate.sessionId = connected.id
+  gate.marker = `plan510-connected-note-${process.pid}-${Date.now()}`
+  await sendNote({ workspace, plumbSh, to: connected.name, body: gate.marker })
+  console.log(`  gate: sent a note to ${connected.name} (session ${connected.id}) while it is connected`)
+  const ended = await pollFor(() => agentRecords({ root }).find((r) => r.id === connected.id && r.ended), idleMs + DECLARE_TIMEOUT_MS)
+  if (!ended) throw new Error(`the agent's connection never idle-closed (session ${connected.id} has no end after ${idleMs + DECLARE_TIMEOUT_MS} ms)`)
+  gate.ended = true
+  console.log(`  gate: plumb recorded the end of session ${connected.id}; releasing the model's check_messages`)
+}
+
+/**
+ * Send one note from a short-lived plumb session of its own (plumb's CLI
+ * cannot send mail). Speaks MCP's stdio framing directly, one JSON-RPC message
+ * per line, so the harness needs no SDK.
+ */
+async function sendNote({ workspace, plumbSh, to, body }) {
   const child = spawn(plumbSh, ['serve'], { cwd: workspace, stdio: ['pipe', 'pipe', 'pipe'] })
   let stderr = ''
   child.stderr.on('data', (data) => { stderr += data })
@@ -275,8 +361,7 @@ async function fileWaitingNote({ workspace, plumbSh }) {
     await call('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'dsh-identity-e2e-sender', version: '1' } })
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`)
     await toolCall('session_start', { session_id: 'dsh-identity-e2e-sender', workspace })
-    await toolCall('leave_note', { to: 'next', body: marker })
-    console.log(`  setup: left a note for the next session (${marker})`)
+    await toolCall('leave_note', { to, body })
   } finally {
     child.stdin.end()
     await new Promise((resolve) => {
@@ -285,7 +370,6 @@ async function fileWaitingNote({ workspace, plumbSh }) {
       child.once('exit', () => { clearTimeout(timer); resolve() })
     })
   }
-  return { marker }
 }
 
 /**
@@ -329,7 +413,7 @@ function isPlumbDaemon(pid) {
 
 // -- throwaway environment ---------------------------------------------------------
 
-function buildDshHome({ root, fakeUrl, plumbSh, hoisted }) {
+function buildDshHome({ root, fakeUrl, plumbSh, hoisted, idleMs }) {
   const home = path.join(root, 'dsh-home')
   const profile = path.join(home, 'profiles', 'e2e')
   fs.mkdirSync(profile, { recursive: true })
@@ -376,9 +460,12 @@ llm-pi-ai:
         # control that proves the per-agent assertions fail if the feature
         # silently reverts to stamping.
         perAgentConnection: ${process.env.E2E_PER_AGENT === '0' ? 'false' : 'true'}
-        # 60 s here unless E2E_IDLE_MS says otherwise (a smaller value ends
-        # each run sooner); the plugin's production default is 15 s.
-        idleMs: ${Number(process.env.E2E_IDLE_MS ?? 60000)}
+        # 60 s here unless the scenario or E2E_IDLE_MS says otherwise (a
+        # smaller value ends each run sooner); the production default is 15 s.
+        idleMs: ${idleMs}
+        # E2E_RESUME_PROOF=0 declares without plumb's resume proof: the
+        # control that proves the reconnect scenario fails without it.
+        resumeProof: ${process.env.E2E_RESUME_PROOF === '0' ? 'false' : 'true'}
     - id: mcp-plumb
       name: '@deepseek-ai/dsh-mcp-client'
       config:
@@ -394,7 +481,9 @@ llm-pi-ai:
 /**
  * The plumb side of the scenario must not touch the developer's real daemon
  * state, so the mcp row's command is a wrapper that relocates every writable
- * plumb root under the temp tree. TSM_ORIG_* companions are stripped because
+ * plumb root under the temp tree. It passes its arguments through: the plugin
+ * runs it as `serve` and, for the resume proof, as `hooks run-claude`, whose
+ * key must be this scenario's too. TSM_ORIG_* companions are stripped because
  * plumb's session-manager hijack recovery would otherwise see a temp XDG
  * override and "recover" it back at the real user state.
  */
@@ -415,7 +504,7 @@ export XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
 unset TSM_ORIG_HOME TSM_ORIG_XDG_CONFIG_HOME TSM_ORIG_XDG_DATA_HOME TSM_ORIG_XDG_STATE_HOME TSM_ORIG_XDG_CACHE_HOME
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$XDG_CACHE_HOME" \\
   "$HOME/Library/Caches" "$HOME/Library/Logs"
-exec '${plumbBin}' serve
+exec '${plumbBin}' "$@"
 `)
   fs.chmodSync(wrapper, 0o755)
   return wrapper
@@ -474,10 +563,44 @@ function readSessionRecords({ root }) {
       // Minted ids are `dsh-<workspace-slug>-<short>`; main-conversation
       // shorts carry a `-session-` segment, subagent shorts are a bare uuid
       // fragment — so match the minted shape, not either convention.
-      records.push({ file, clientName, externalId, purpose, isIdentity: /^dsh-[a-z0-9-]{12,}$/.test(externalId ?? '') })
+      // A Go zero time is how plumb writes "not ended" (omitempty does not
+      // omit a struct), so only a real timestamp counts as an end.
+      const ended = typeof record.ended_at === 'string' && !record.ended_at.startsWith('0001-')
+      records.push({
+        file,
+        id: typeof record.id === 'string' ? record.id : null,
+        name: typeof record.name === 'string' ? record.name : null,
+        ended,
+        clientName,
+        externalId,
+        purpose,
+        isIdentity: /^dsh-[a-z0-9-]{12,}$/.test(externalId ?? ''),
+      })
     }
   }
   return records
+}
+
+/**
+ * The main agent's DECLARED sessions: its own-connection records that carry
+ * its external id. A reconnecting serve also leaves a short-lived record with
+ * no external id: the session it was given on connect, ended within
+ * milliseconds when its session_start resumed the agent's own. That record is
+ * the connection, not the agent, so it is not one of these.
+ */
+function agentRecords(ctx) {
+  return readSessionRecords(ctx).filter((r) => r.clientName === 'dsh-plumb-identity' && r.purpose === 'dsh' && r.isIdentity && r.id !== null)
+}
+
+/** Poll `probe` until it returns something truthy, or null at the deadline. */
+async function pollFor(probe, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const hit = probe()
+    if (hit) return hit
+    if (Date.now() >= deadline) return null
+    await sleep(250)
+  }
 }
 
 function walkDirs(dir, depth) {

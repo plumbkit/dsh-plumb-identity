@@ -12,7 +12,10 @@ const pluginUrl = new URL('../dsh-plumb-identity.mjs', import.meta.url)
 const fixtureDshHome = join(here, 'fixtures/dshhome')
 const fixtureSdkUrl = new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js', import.meta.url).href
 
-const { name, inject, defaultConfig, resolveAgentContext, mintIdentity, shouldSkip, apply, resolvePlumbCommand, mcpContentText, refusesMailPreview } = await import(pluginUrl)
+const {
+  name, inject, defaultConfig, resolveAgentContext, mintIdentity, shouldSkip, apply, resolvePlumbCommand, mcpContentText, refusesMailPreview,
+  resumeProofArgs, resumeProofRequest, resumeProofFields, resumeProofEnv, runResumeProof
+} = await import(pluginUrl)
 const { requests, toolCalls, clients, fixtureState, Client } = await import(fixtureSdkUrl)
 const { spawned, instances } = await import(new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js', import.meta.url).href)
 
@@ -30,7 +33,15 @@ const { spawned, instances } = await import(new URL('./fixtures/dshhome/.dsh/pro
  * one `plumb serve` per agent — against the fixture's stdio transport.
  */
 const mount = (ctx, extra = {}) => apply(ctx, { sdkPath: fixtureSdkUrl, perAgentConnection: false, ...extra })
-const mountPerAgent = (ctx, extra = {}) => apply(ctx, { sdkPath: fixtureSdkUrl, perAgentConnection: true, ...extra })
+
+/**
+ * The per-agent path runs plumb's identity hook for the resume proof, so its
+ * mount names a fake of that hook as the plumb command: the fixture transport
+ * never spawns the serve, but the proof is a real child process, and it must
+ * not be the developer's plumb.
+ */
+const fakeHook = fileURLToPath(new URL('./fixtures/fake-plumb-hook.mjs', import.meta.url))
+const mountPerAgent = (ctx, extra = {}) => apply(ctx, { sdkPath: fixtureSdkUrl, perAgentConnection: true, plumbCommand: fakeHook, ...extra })
 
 /** Every fixture-side record the per-agent tests assert on. */
 function resetFixture () {
@@ -113,7 +124,9 @@ test('defaultConfig carries the documented defaults', () => {
     plumbCommand: '',
     plumbArgs: ['serve'],
     maxConnections: 16,
-    idleMs: 15_000
+    idleMs: 15_000,
+    resumeProof: true,
+    resumeProofTimeoutMs: 5_000
   })
 })
 
@@ -568,14 +581,18 @@ test("a plumb call runs over the agent's OWN connection, never the shared one", 
 
     // Declared on that connection, with this agent's minted id and workspace,
     // previewing mail rather than claiming it: this is the DEFAULT path, so it is
-    // the one that loses a note if the argument goes missing (PLAN-500).
+    // the one that loses a note if the argument goes missing (PLAN-500). It also
+    // carries the hook's stamp and resume proof, without which a reconnect
+    // gives the agent a new plumb session (PLAN-510).
     const declare = toolCalls.find((call) => call.name === 'session_start')
     assert.deepEqual(declare.arguments, {
       session_id: 'dsh-w-own-conv-own',
       workspace: '/w/own',
       purpose: 'dsh',
       detail: 'brief',
-      mail: 'preview'
+      mail: 'preview',
+      plumb_agent: 'dsh-w-own-conv-own',
+      plumb_hook_proof: 'proof-of-dsh-w-own-conv-own'
     })
 
     // The call itself went over the SAME client instance.
@@ -869,6 +886,176 @@ test('per-agent connection: any other refusal is reported, not retried as a mail
     assert.equal(ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('predates')).length, 0)
     const refused = ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('refused the declaration of dsh-w-m-conv-pa-pin'))
     assert.equal(refused.length, 1, 'a refusal on the own connection is reported, not silently ignored')
+  } finally {
+    fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
+})
+
+// -- resume proof (PLAN-510) ---------------------------------------------------
+
+const proofLog = () => join(fileURLToPath(new URL('.', import.meta.url)), `.fake-hook-${process.pid}-${Math.random().toString(36).slice(2)}.log`)
+
+async function readProofLog (file) {
+  const { readFile, rm } = await import('node:fs/promises')
+  const text = await readFile(file, 'utf8').catch(() => '')
+  await rm(file, { force: true })
+  return text.split('\n').filter(Boolean).map((line) => JSON.parse(line))
+}
+
+/** Run fn with process.env overrides, restoring them afterwards. */
+async function withEnv (overrides, fn) {
+  const saved = {}
+  for (const [key, value] of Object.entries(overrides)) {
+    saved[key] = process.env[key]
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+  try {
+    return await fn()
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+}
+
+test('resumeProofRequest is a PreToolUse session_start naming the id, under the name the hook matches', () => {
+  assert.deepEqual(resumeProofArgs, ['hooks', 'run-claude'])
+  assert.deepEqual(resumeProofRequest('dsh-a-b'), {
+    hook_event_name: 'PreToolUse',
+    tool_name: 'mcp__plumb__session_start',
+    session_id: 'dsh-a-b',
+    tool_input: { session_id: 'dsh-a-b' }
+  })
+})
+
+test('resumeProofFields keeps only the stamp and the proof, for exactly this id', () => {
+  const out = (updatedInput) => JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput } })
+  assert.deepEqual(
+    resumeProofFields('x', out({ session_id: 'x', plumb_agent: 'x', plumb_hook_proof: 'p', workspace: '/elsewhere' })),
+    { plumb_agent: 'x', plumb_hook_proof: 'p' },
+    'anything else the hook echoes is not taken'
+  )
+  assert.deepEqual(
+    resumeProofFields('x', out({ session_id: 'x', 'dev.plumbkit/logical-agent': 'x', plumb_hook_proof: 'p' })),
+    { 'dev.plumbkit/logical-agent': 'x', plumb_hook_proof: 'p' },
+    "an older daemon's stamp key"
+  )
+  // Each of these is a declaration that goes out unproved.
+  assert.equal(resumeProofFields('x', ''), null, 'a silent hook')
+  assert.equal(resumeProofFields('x', 'not json'), null)
+  assert.equal(resumeProofFields('x', 'null'), null)
+  assert.equal(resumeProofFields('x', out({ session_id: 'x', plumb_agent: 'x' })), null, 'stamped but no proof')
+  assert.equal(resumeProofFields('x', out({ session_id: 'x', plumb_agent: 'x', plumb_hook_proof: '' })), null, 'an empty proof')
+  assert.equal(resumeProofFields('x', out({ session_id: 'x', plumb_agent: 'x', plumb_hook_proof: 7 })), null, 'a proof that is not a string')
+  assert.equal(resumeProofFields('x', out({ session_id: 'y', plumb_agent: 'y', plumb_hook_proof: 'p' })), null, "another id's proof")
+  assert.equal(resumeProofFields('x', out({ session_id: 'x', plumb_agent: 'y', plumb_hook_proof: 'p' })), null, 'a stamp for another id')
+  assert.equal(resumeProofFields('x', out({ session_id: 'x', plumb_hook_proof: 'p' })), null, 'a proof with no stamp')
+})
+
+test("resumeProofEnv drops plumb's Claude Code hook switch and nothing else", () => {
+  assert.deepEqual(resumeProofEnv({ PATH: '/bin', PLUMB_IDENTITY_HOOK: 'off', HOME: '/h', UNSET: undefined }), { PATH: '/bin', HOME: '/h' })
+})
+
+test('runResumeProof runs plumb hooks run-claude and returns its proof', async () => {
+  const log = proofLog()
+  const got = await runResumeProof(fakeHook, 'dsh-w-p', resumeProofEnv({ ...process.env, FAKE_PLUMB_HOOK_LOG: log, PLUMB_IDENTITY_HOOK: 'off' }), 5_000)
+  assert.deepEqual(got, { fields: { plumb_agent: 'dsh-w-p', plumb_hook_proof: 'proof-of-dsh-w-p' }, why: '' })
+  const runs = await readProofLog(log)
+  assert.equal(runs.length, 1)
+  assert.deepEqual(runs[0].argv, ['hooks', 'run-claude'])
+  assert.deepEqual(runs[0].event, resumeProofRequest('dsh-w-p'))
+  assert.equal(runs[0].killSwitch, null, 'the Claude Code kill switch never reaches the hook')
+})
+
+test('runResumeProof fails open: silence, a stall and a missing binary each give no proof and a reason', async () => {
+  const silent = await runResumeProof(fakeHook, 'id', { ...process.env, FAKE_PLUMB_HOOK: 'silent' }, 5_000)
+  assert.equal(silent.fields, null)
+  assert.match(silent.why, /fake daemon takes no proof/, "the hook's own reason is reported")
+
+  const mismatch = await runResumeProof(fakeHook, 'id', { ...process.env, FAKE_PLUMB_HOOK: 'mismatch' }, 5_000)
+  assert.equal(mismatch.fields, null)
+
+  const started = Date.now()
+  const stalled = await runResumeProof(fakeHook, 'id', { ...process.env, FAKE_PLUMB_HOOK: 'stall' }, 300)
+  assert.equal(stalled.fields, null)
+  assert.match(stalled.why, /did not answer within 300 ms/)
+  assert.ok(Date.now() - started < 3_000, 'the timeout bounds the wait')
+
+  const missing = await runResumeProof('/nonexistent/plumb', 'id', process.env, 5_000)
+  assert.equal(missing.fields, null)
+  assert.match(missing.why, /could not (run|start) \/nonexistent\/plumb/)
+})
+
+test('per-agent connection: with no proof the declaration goes out unproved, warned once per process', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  await withEnv({ FAKE_PLUMB_HOOK: 'silent' }, async () => {
+    const ctx = stubCtx()
+    await mountPerAgent(ctx)
+    try {
+      const wrap = ctx.handlers['tools/execute']
+      await wrap({ name: 'mcp__plumb__read_file', arguments: {}, ...conversation('conv-np-a', '/w/np') }, async () => 'shared')
+      await wrap({ name: 'mcp__plumb__read_file', arguments: {}, ...conversation('conv-np-b', '/w/np') }, async () => 'shared')
+      const declares = toolCalls.filter((call) => call.name === 'session_start')
+      assert.equal(declares.length, 2)
+      for (const call of declares) {
+        assert.equal('plumb_hook_proof' in call.arguments, false)
+        assert.equal('plumb_agent' in call.arguments, false)
+        assert.equal(call.arguments.mail, 'preview', 'the declaration is otherwise unchanged')
+      }
+      const warned = ctx.logs.filter(([level, msg]) => level === 'warn' && msg.includes('no resume proof'))
+      assert.equal(warned.length, 1, 'once per process, not once per connection')
+      assert.match(warned[0][1], /fake daemon takes no proof/)
+    } finally {
+      await ctx.handlers.dispose?.()
+    }
+  })
+})
+
+test('per-agent connection: resumeProof false never runs the hook', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const log = proofLog()
+  await withEnv({ FAKE_PLUMB_HOOK_LOG: log }, async () => {
+    const ctx = stubCtx()
+    await mountPerAgent(ctx, { resumeProof: false })
+    try {
+      await ctx.handlers['tools/execute']({ name: 'mcp__plumb__read_file', arguments: {}, ...conversation('conv-off', '/w/off') }, async () => 'shared')
+      const declare = toolCalls.find((call) => call.name === 'session_start')
+      assert.equal('plumb_hook_proof' in declare.arguments, false)
+      assert.equal(ctx.logs.filter(([, msg]) => msg.includes('no resume proof')).length, 0)
+    } finally {
+      await ctx.handlers.dispose?.()
+    }
+  })
+  assert.deepEqual(await readProofLog(log), [], 'the hook was not run')
+})
+
+test('per-agent connection: each connection proves its own agent, and the mail fallback keeps the proof', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  fixtureState.sessionStartRefusals = [oldPlumbRefusal()]
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    const wrap = ctx.handlers['tools/execute']
+    await wrap({ name: 'mcp__plumb__read_file', arguments: {}, ...conversation('conv-pf-a', '/w/pf') }, async () => 'shared')
+    await wrap({
+      name: 'mcp__plumb__read_file',
+      arguments: {},
+      ...conversation('conv-pf-b', '/w/pf', { parentSession: 'conv-pf-a', delegationDepth: 1 })
+    }, async () => 'shared')
+    const declares = toolCalls.filter((call) => call.name === 'session_start')
+    assert.equal(declares.length, 3, 'refused once for mail, retried, then the subagent')
+    assert.equal(declares[1].arguments.mail, undefined, 'the retry omits mail')
+    for (const call of declares) {
+      assert.equal(call.arguments.plumb_agent, call.arguments.session_id, 'the stamp is the declared id')
+      assert.equal(call.arguments.plumb_hook_proof, `proof-of-${call.arguments.session_id}`)
+    }
+    assert.deepEqual(declares.map((call) => call.arguments.session_id), ['dsh-w-pf-conv-pf-a', 'dsh-w-pf-conv-pf-a', 'dsh-w-pf-conv-pf-b'])
   } finally {
     fixtureState.sessionStartRefusals = []
     await ctx.handlers.dispose?.()

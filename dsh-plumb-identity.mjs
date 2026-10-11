@@ -82,6 +82,7 @@
 
 import { homedir } from 'node:os'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { spawn } from 'node:child_process'
 
 /** Stable cordis plugin name (loader diagnostics, HMR swap, patch overrides). */
 export const name = 'dsh-plumb-identity'
@@ -147,8 +148,19 @@ export function defaultConfig () {
     // plugins, so a connection that is merely idle outlives the run and the
     // process then never exits. Reconnecting is cheap and self-healing —
     // `connectionFor` re-declares the agent and its workspace on every connect
-    // — so an idle close costs one spawn, not correctness.
-    idleMs: 15_000
+    // — so an idle close costs one spawn, not correctness. What keeps the
+    // reconnect from costing the agent its plumb SESSION (and the mail bound
+    // to it) is `resumeProof`, below.
+    idleMs: 15_000,
+    // Prove each per-agent declaration with plumb's own resume proof, so a
+    // reconnecting agent resumes its plumb session instead of being given a
+    // new one (PLAN-510; runResumeProof says how). false declares by name
+    // only: the agent keeps its name but not its session id, and a note bound
+    // to the old id strands on every reconnect.
+    resumeProof: true,
+    // How long the child that computes the proof may take. Past it the
+    // declaration goes out unproved, which is the name-only resume.
+    resumeProofTimeoutMs: 5_000
   }
 }
 
@@ -229,6 +241,138 @@ export function declarationArgs (cfg, agentContext, ident, withMailPreview) {
 export function refusesMailPreview (result) {
   if (result?.isError !== true) return false
   return /unknown parameter "mail"/.test(mcpContentText(result.content, 'session_start'))
+}
+
+// -- Resume proof (PLAN-510) -------------------------------------------------
+//
+// Every per-agent connection is a new `plumb serve`, and plumb gives a new
+// connection a new session id unless the serve can RESUME the old one. It can:
+// a serve keeps a resume credential per conversation and presents it when a
+// replacement serve names the same conversation, and the daemon then restores
+// the session, its id, its threads and the mail bound to it. But a serve
+// presents only for a conversation it can tell was named by the user's own
+// tooling rather than typed by a model: the session_start must carry the
+// identity stamp plus `plumb_hook_proof`, an HMAC of the stamp under a per-user
+// key the model never sees (plumb's internal/cli/resume_proof.go). Without it
+// the resume is by name only: the measured DSH behaviour of one name and a new
+// session id on every reconnect, with each note bound to an id that is gone.
+//
+// The proof is not computed here. plumb's own identity hook computes it
+// (`plumb hooks run-claude`, the command Claude Code runs before every plumb
+// call), so the key's location, its creation, the stamp key the running daemon
+// takes, and whether that daemon accepts a proof at all stay plumb's business,
+// and this plugin keeps nothing of plumb's identity internals in sync. The
+// plugin hands the hook a session_start naming the agent and keeps exactly two
+// things from its answer: the stamp, and the proof. Nothing is weakened: the
+// serve still verifies the proof against the key, and the plugin only asks for
+// a proof of the id it already declares.
+
+/** The plumb subcommand that computes the proof: plumb's identity hook. */
+export const resumeProofArgs = ['hooks', 'run-claude']
+
+/** plumb's proof argument, from plumb's internal/mcp/meta_keys.go. */
+export const hookProofKey = 'plumb_hook_proof'
+
+/**
+ * The argument keys the hook may stamp the identity under, from plumb's
+ * internal/mcp/meta_keys.go: the current daemon's key, and the one an older
+ * daemon lifts.
+ */
+const stampKeys = ['plumb_agent', identityMetaKey]
+
+/**
+ * The hook's stdin: one PreToolUse event for a session_start that names `id`.
+ * The hook matches plumb's tools by the `mcp__plumb__` prefix whatever the
+ * server is called in DSH, so the name is fixed.
+ */
+export function resumeProofRequest (id) {
+  return {
+    hook_event_name: 'PreToolUse',
+    tool_name: 'mcp__plumb__session_start',
+    session_id: id,
+    tool_input: { session_id: id }
+  }
+}
+
+/**
+ * The arguments to add to a declaration of `id`, read from the hook's stdout:
+ * `{ <stamp key>: id, plumb_hook_proof: <proof> }`, or null when the answer
+ * carries no proof for exactly this id. The hook stays silent when the daemon
+ * does not take a proof (or no daemon answered), and that is null too: the
+ * declaration then goes out as it always did.
+ */
+export function resumeProofFields (id, stdout) {
+  let updated
+  try {
+    updated = JSON.parse(stdout)?.hookSpecificOutput?.updatedInput
+  } catch {
+    return null
+  }
+  if (updated === null || typeof updated !== 'object' || updated.session_id !== id) return null
+  const proof = updated[hookProofKey]
+  if (typeof proof !== 'string' || proof.length === 0) return null
+  const key = stampKeys.find((candidate) => updated[candidate] === id)
+  if (key === undefined) return null
+  return { [key]: id, [hookProofKey]: proof }
+}
+
+/**
+ * The hook's environment: the per-agent proxy's, minus plumb's switch that
+ * turns the Claude Code hook off. That switch is for a user who runs their own
+ * linkage in Claude Code; here the hook is not stamping a model's call, it is
+ * asked for the proof of an identity this plugin already declares.
+ */
+export function resumeProofEnv (env) {
+  const out = childEnv(env)
+  delete out.PLUMB_IDENTITY_HOOK
+  return out
+}
+
+/** The first line of the hook's stderr, which names why it stamped nothing. */
+function hookReason (stderr) {
+  const line = String(stderr).split('\n').map((part) => part.trim()).find((part) => part.length > 0)
+  return line === undefined ? 'the hook returned no proof' : line.slice(0, 200)
+}
+
+/**
+ * Run the hook once for `id`. Resolves `{ fields, why }`: the fields to add to
+ * the declaration, or null with the reason there are none. Never rejects, and
+ * never takes longer than `timeoutMs`: a declaration without a proof is what
+ * this plugin sent before PLAN-510, so every failure falls back to it.
+ */
+export function runResumeProof (command, id, env, timeoutMs) {
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawn(command, resumeProofArgs, { env, stdio: ['pipe', 'pipe', 'pipe'] })
+    } catch (error) {
+      resolve({ fields: null, why: `could not start ${command}: ${String(error).slice(0, 160)}` })
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const settle = (why) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      const fields = why === null ? resumeProofFields(id, stdout) : null
+      resolve({ fields, why: fields !== null ? '' : (why ?? hookReason(stderr)) })
+    }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch { /* already gone */ }
+      settle(`${command} ${resumeProofArgs.join(' ')} did not answer within ${timeoutMs} ms`)
+    }, timeoutMs)
+    timer.unref?.()
+    child.stdout.on('data', (chunk) => { stdout += chunk })
+    child.stderr.on('data', (chunk) => { stderr += chunk })
+    child.on('error', (error) => settle(`could not run ${command}: ${String(error).slice(0, 160)}`))
+    child.on('close', () => settle(null))
+    // A child that exits before reading its stdin must not become an
+    // unhandled EPIPE in the host.
+    child.stdin.on('error', () => {})
+    child.stdin.end(JSON.stringify(resumeProofRequest(id)))
+  })
 }
 
 /**
@@ -568,6 +712,25 @@ export async function apply (ctx, config) {
   const connectionFaults = new Set()
   let connectionsClosed = false
   let capabilityNoted = false
+  let resumeProofWarned = false
+
+  /**
+   * The proof fields for a per-agent declaration of `ident`, or none. A
+   * missing proof is reported once per process: the agent still works, but
+   * each reconnect gives it a new plumb session, and mail bound to the old one
+   * strands, which is a fact a reader of the log needs.
+   */
+  async function resumeProofFor (ident) {
+    if (cfg.resumeProof !== true) return {}
+    const { fields, why } = await runResumeProof(resolvePlumbCommand(cfg, process.env), ident.id, resumeProofEnv(process.env), cfg.resumeProofTimeoutMs)
+    debug('resume proof', ident.id, fields === null ? `none: ${why}` : 'attached')
+    if (fields !== null) return fields
+    if (!resumeProofWarned) {
+      resumeProofWarned = true
+      ctx.logger?.warn?.(`${name}: no resume proof for ${ident.id} (${why}); its plumb session resumes by name only, so each reconnect starts a new session and a note bound to the old one can strand (PLAN-510)`)
+    }
+    return {}
+  }
 
   /**
    * The stdio transport and client classes this mode needs, or null when the
@@ -683,13 +846,19 @@ export async function apply (ctx, config) {
       entry.toolNames = new Set((listed?.tools ?? []).map((tool) => tool.name))
       debug('advertised', key, entry.toolNames.size + ' tools')
 
+      // Prove the declaration, so a reconnect resumes this agent's plumb
+      // session rather than starting a new one (PLAN-510). Only now: the hook
+      // asks the running daemon whether it takes a proof, and on a first
+      // connect it is this serve that started the daemon.
+      const proof = await resumeProofFor(ident)
+
       // Declare this agent ON ITS OWN CONNECTION. Nothing else shares it, so
       // the id and the workspace pin cannot land on another agent's shard.
       // Automatic, like the shared declaration, so it previews mail rather than
       // claiming it (declarationArgs says why). callTool returns plumb's refusal
       // as an ordinary isError result, so it is read, not left to a catch.
       const declare = (withMailPreview) => client.callTool(
-        { name: 'session_start', arguments: declarationArgs(cfg, agentContext, ident, withMailPreview) },
+        { name: 'session_start', arguments: { ...declarationArgs(cfg, agentContext, ident, withMailPreview), ...proof } },
         resultSchema ?? undefined
       )
       try {
