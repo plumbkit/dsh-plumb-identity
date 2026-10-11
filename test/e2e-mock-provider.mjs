@@ -268,8 +268,11 @@ function readDaemonLog(root) {
 // never reaches runScenario's finally, so end and stop these before exiting.
 const liveRoots = new Set()
 const liveGroups = new Set()
+// Set by the handler: main starts no further scenario and leaves the exit to it.
+let shuttingDown = false
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.once(signal, () => {
+    shuttingDown = true
     console.error(`\ne2e: ${signal}: stopping the plumb daemon of ${liveRoots.size} unfinished scenario(s)`)
     endDshGroups()
       .then((problems) => problems.forEach((problem) => console.error(`  teardown: ${problem}`)))
@@ -313,9 +316,12 @@ async function main() {
 
   let failures = 0
   for (const mode of wanted) {
+    if (shuttingDown) break
     const passed = await runScenario({ mode, task: SCENARIOS[mode].task, harness, plumbBin, keep })
     if (!passed) failures += 1
   }
+  // A signal handler is tearing down and will exit with 128 + its signal.
+  if (shuttingDown) return new Promise(() => {})
   console.log(failures === 0 ? `\ne2e: all ${wanted.length} scenario(s) passed` : `\ne2e: ${failures} scenario(s) FAILED`)
   process.exit(failures === 0 ? 0 : 1)
 }
@@ -392,13 +398,14 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
   } catch (error) {
     console.error(`  FAIL ${mode}: ${error.message}`)
   } finally {
-    if (fake) await fake.close()
     // End dsh and any serve it left before stopping the daemon, or that serve
-    // redials and starts a new one.
+    // redials and starts a new one. First, so a fake model still holding a
+    // connection open cannot keep the teardown from running.
     for (const problem of await endDshGroups()) {
       console.error(`  FAIL ${mode}: teardown: ${problem}`)
       passed = false
     }
+    if (fake) await fake.close()
     // PLAN-507: `plumb serve` daemonizes this scenario's plumb daemon, so
     // nothing above ends it. Stop it on pass AND fail, before its HOME is
     // deleted, and fail the scenario (keeping the root) unless teardown can

@@ -25,13 +25,16 @@ import path from 'node:path'
  *
  * Returns `{ stopped, problems }`: the pids that were signalled and exited,
  * and every reason the scenario must not be called clean. An empty `problems`
- * means no plumb socket under `plumbHome` accepts a connection, no pidfile
- * there names a live process, and both still held after `settleMs`, so a
- * daemon respawned by a lingering serve is caught too.
+ * means that `settleMs` after the stop no plumb socket under `plumbHome` may
+ * still have a listener, every pidfile there could be read, and none names a
+ * live process other than one `ps` identified as something else (a reused
+ * pid). A daemon respawned by a lingering serve is therefore reported, though
+ * not stopped.
  */
 export async function stopIsolatedDaemon(plumbHome, {
   probeCommand = psCommand,
-  stopWaitMs = 10_000,
+  // plumb's own shutdown watchdog fires at 10 s; `plumb stop` waits a little longer.
+  stopWaitMs = 12_000,
   settleMs = 2_000,
 } = {}) {
   const problems = []
@@ -41,17 +44,18 @@ export async function stopIsolatedDaemon(plumbHome, {
   const listeningBefore = await listeningSockets(plumbHome)
   const targets = []
   const foreign = []
-  for (const pid of pidfilePids(plumbHome)) {
+  for (const { pid, mtimeMs } of readPidfiles(plumbHome, problems)) {
     if (!isAlive(pid)) continue
     const command = probeCommand(pid)
     if (command === null) {
-      // `ps` could not answer (a sandbox denies it). The pidfile is written by
-      // the daemon holding this HOME's lifetime lock, and a socket here that
-      // accepts connections proves that holder is alive, so the pid is ours.
-      // Without a listening socket the pid may be a reused one: report it
-      // rather than signal a process that may not be plumb.
-      if (listeningBefore.length > 0) targets.push(pid)
-      else problems.push(`pid ${pid} from a pidfile under ${plumbHome} is alive, but ps is unavailable and no plumb socket there is listening, so it cannot be confirmed as this scenario's daemon`)
+      // `ps` could not answer (a sandbox denies it). plumb binds its socket and
+      // then writes the pidfile, both while holding this HOME's lifetime lock,
+      // and removes the pidfile on a clean exit. So a pidfile written no earlier
+      // than a socket here that accepts connections belongs to the live lock
+      // holder. An older pidfile, or one with no listening socket, may name a
+      // reused pid: report it rather than signal a process that may not be plumb.
+      if (listeningBefore.some((socket) => socket.mtimeMs <= mtimeMs)) targets.push(pid)
+      else problems.push(`pid ${pid} from a pidfile under ${plumbHome} is alive, but ps is unavailable and no plumb socket there that is listening predates the pidfile, so it cannot be confirmed as this scenario's daemon`)
     } else if (/\bplumb\b.*\bdaemon\b/.test(command)) {
       targets.push(pid)
     } else {
@@ -75,12 +79,12 @@ export async function stopIsolatedDaemon(plumbHome, {
   }
 
   // Settle, then look again: a serve still running could have respawned a
-  // daemon after the one above exited.
+  // daemon after the one above exited. That is reported, not stopped.
   await sleep(settleMs)
-  for (const socket of await listeningSockets(plumbHome)) {
+  for (const { path: socket } of await listeningSockets(plumbHome)) {
     problems.push(`a plumb daemon is still listening on ${socket}`)
   }
-  for (const pid of pidfilePids(plumbHome)) {
+  for (const { pid } of readPidfiles(plumbHome, problems)) {
     if (isAlive(pid) && !targets.includes(pid) && !foreign.includes(pid)) problems.push(`a pidfile under ${plumbHome} names live pid ${pid} after teardown`)
   }
   return { stopped, problems }
@@ -117,35 +121,58 @@ function groupAlive(pgid) {
 
 /** The command line of `pid`, or null when `ps` cannot be run or answers nothing. */
 export function psCommand(pid) {
-  const ps = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
+  const ps = spawnSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 })
   if (ps.error || ps.status !== 0) return null
   const command = ps.stdout.trim()
   return command === '' ? null : command
 }
 
-function pidfilePids(plumbHome) {
-  return walkDirs(plumbHome, 0)
-    .map((dir) => path.join(dir, 'plumb.pid'))
-    .filter((file) => fs.existsSync(file))
-    .map((file) => Number.parseInt(fs.readFileSync(file, 'utf8').trim(), 10))
-    .filter((pid) => Number.isInteger(pid) && pid > 1)
+/**
+ * Every plumb.pid under `plumbHome` naming a plausible pid, with its mtime. A
+ * pidfile that vanishes mid-scan (a daemon exiting) is skipped; one that cannot
+ * be read is a problem, not an exception that would skip the rest of teardown.
+ */
+function readPidfiles(plumbHome, problems) {
+  const out = []
+  for (const dir of walkDirs(plumbHome, 0)) {
+    const file = path.join(dir, 'plumb.pid')
+    let text
+    let mtimeMs
+    try {
+      text = fs.readFileSync(file, 'utf8')
+      mtimeMs = fs.statSync(file).mtimeMs
+    } catch (error) {
+      if (error.code !== 'ENOENT') problems.push(`could not read ${file}: ${error.code ?? error.message}`)
+      continue
+    }
+    // Never 0, 1 or a negative: process.kill would signal a group or everything.
+    const pid = Number.parseInt(text.trim(), 10)
+    if (Number.isInteger(pid) && pid > 1) out.push({ pid, mtimeMs })
+  }
+  return out
 }
 
+/** The plumb.sock files under `plumbHome` that accept a connection, with their mtimes. */
 async function listeningSockets(plumbHome) {
-  const sockets = walkDirs(plumbHome, 0)
-    .map((dir) => path.join(dir, 'plumb.sock'))
-    .filter((file) => fs.existsSync(file))
   const live = []
-  for (const socket of sockets) {
-    if (await accepts(socket)) live.push(socket)
+  for (const dir of walkDirs(plumbHome, 0)) {
+    const socket = path.join(dir, 'plumb.sock')
+    let mtimeMs
+    try {
+      mtimeMs = fs.lstatSync(socket).mtimeMs
+    } catch {
+      continue
+    }
+    if (await accepts(socket)) live.push({ path: socket, mtimeMs })
   }
   return live
 }
 
 /**
- * Whether a Unix socket accepts a connection. A probe that neither connects
- * nor fails within a second counts as listening: a wedged daemon is not a
- * stopped one.
+ * Whether a Unix socket may have a live listener. Only an answer that proves
+ * nobody is there (refused, gone, not a socket) reads as stopped. Any other
+ * error, or a probe that neither connects nor fails within a second, counts as
+ * listening: a wedged or unreachable daemon is not a stopped one.
  */
 function accepts(socket) {
   return new Promise((resolve) => {
@@ -157,7 +184,7 @@ function accepts(socket) {
     }
     const timer = setTimeout(() => done(true), 1_000)
     conn.once('connect', () => done(true))
-    conn.once('error', () => done(false))
+    conn.once('error', (error) => done(!['ECONNREFUSED', 'ENOENT', 'ENOTSOCK'].includes(error.code)))
   })
 }
 

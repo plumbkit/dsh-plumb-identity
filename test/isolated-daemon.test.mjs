@@ -28,7 +28,7 @@ function scratchHome(t) {
     // Kill whatever the case left behind, by the pidfile and the pids it started.
     for (const pid of started) killQuietly(pid)
     const pidFile = path.join(runtimeDir, 'plumb.pid')
-    if (fs.existsSync(pidFile)) killQuietly(Number(fs.readFileSync(pidFile, 'utf8')))
+    try { killQuietly(Number(fs.readFileSync(pidFile, 'utf8'))) } catch { /* no pidfile, or not a file */ }
     fs.rmSync(root, { recursive: true, force: true })
   })
   return { plumbHome, runtimeDir, started }
@@ -54,6 +54,7 @@ function staleDaemonPidfile({ runtimeDir, started }) {
 }
 
 function killQuietly(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return // never a group or every process
   try { process.kill(pid, 'SIGKILL') } catch { /* gone */ }
 }
 
@@ -102,6 +103,46 @@ test('a daemon respawned after the stop is caught by the settle check', async (t
   const { stopped, problems } = await stopIsolatedDaemon(plumbHome, { ...FAST, probeCommand: PS_PLUMB })
   assert.deepEqual(stopped, [pid])
   assert.ok(problems.some((p) => p.includes('still listening')), problems.join('\n'))
+  assert.ok(problems.some((p) => p.includes('names live pid')), problems.join('\n'))
+})
+
+test('a socket file with no listener (a daemon that died without cleaning up) reads as stopped', async (t) => {
+  const home = scratchHome(t)
+  const pid = await startFake(home, 'no-pidfile')
+  process.kill(pid, 'SIGKILL') // no handler runs, so plumb.sock stays behind
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.equal(fs.existsSync(path.join(home.runtimeDir, 'plumb.sock')), true, 'the stale socket file must exist for this case')
+  const { stopped, problems } = await stopIsolatedDaemon(home.plumbHome, { ...FAST, probeCommand: PS_DENIED })
+  assert.deepEqual(stopped, [])
+  assert.deepEqual(problems, [])
+})
+
+test('a socket that refuses with something other than "nobody here" counts as listening', { skip: process.getuid?.() === 0 && 'root bypasses the socket mode' }, async (t) => {
+  const home = scratchHome(t)
+  await startFake(home, 'no-pidfile')
+  fs.chmodSync(path.join(home.runtimeDir, 'plumb.sock'), 0o000) // connect now fails with EACCES
+  const { problems } = await stopIsolatedDaemon(home.plumbHome, { ...FAST, probeCommand: PS_DENIED })
+  assert.ok(problems.some((p) => p.includes('still listening')), problems.join('\n'))
+})
+
+test('ps denied: a pidfile older than the listening socket is reported, never signalled', async (t) => {
+  const home = scratchHome(t)
+  const stale = staleDaemonPidfile(home)
+  const old = new Date(Date.now() - 60_000)
+  fs.utimesSync(path.join(home.runtimeDir, 'plumb.pid'), old, old)
+  await startFake(home, 'no-pidfile') // a live daemon whose socket is newer than that pidfile
+  const { stopped, problems } = await stopIsolatedDaemon(home.plumbHome, { ...FAST, probeCommand: PS_DENIED })
+  assert.deepEqual(stopped, [])
+  assert.ok(problems.some((p) => p.includes(`pid ${stale}`) && p.includes('cannot be confirmed')), problems.join('\n'))
+  assert.equal(isAlive(stale), true, 'a pid from a stale pidfile must not be signalled')
+})
+
+test('an unreadable pidfile is a problem, not an exception that skips teardown', async (t) => {
+  const home = scratchHome(t)
+  fs.mkdirSync(path.join(home.runtimeDir, 'plumb.pid'), { recursive: true }) // reads fail with EISDIR, even as root
+  const { stopped, problems } = await stopIsolatedDaemon(home.plumbHome, { ...FAST, probeCommand: PS_DENIED })
+  assert.deepEqual(stopped, [])
+  assert.ok(problems.some((p) => p.includes('could not read') && p.includes('EISDIR')), problems.join('\n'))
 })
 
 test('ps denied and no listening socket: a live pid from a pidfile is reported, never signalled', async (t) => {
