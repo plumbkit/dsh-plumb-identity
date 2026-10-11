@@ -146,7 +146,10 @@ confused for each other.
 - `plumbCommand`, else `$PLUMB_BIN`, else `plumb` on PATH selects the binary.
 - `idleMs` (default 15 s) closes a connection that has gone unused. It is also
   the only teardown DSH performs: its headless path never disposes plugins, so
-  without an idle close the host process outlives the run that finished.
+  without an idle close the host process outlives the run that finished. A
+  connection with a call IN FLIGHT is never closed: the timer is cleared at
+  dispatch and armed again when the call settles, so a build, a test run, a slow
+  push or a long `check_messages` wait cannot be killed by it (PLAN-516).
 - `resumeProof` (default `true`) lets a reconnect after an idle close resume
   the agent's SAME plumb session, so mail bound to it survives (below).
 - `resumeProofTimeoutMs` (default 5 s) bounds the hook that computes the proof;

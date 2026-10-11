@@ -53,6 +53,7 @@ function resetFixture () {
   instances.length = 0
   fixtureState.toolResults = {}
   fixtureState.failToolCall = false
+  fixtureState.toolCallDelayMs = 0
   fixtureState.listedTools = ['session_start', 'read_file', 'edit_file', 'write_file', 'daemon_info']
 }
 
@@ -1214,6 +1215,59 @@ test('only session_start is normalised: another call keeps its arguments exactly
   }
 })
 
+// -- PLAN-516: a call must outlive the idle timer ------------------------------
+//
+// The idle close used to be armed BEFORE `callTool` and never paused, so it
+// closed the client the call was waiting on: a 40 s `check_messages` wait died at
+// ~15 s with `MCP error -32000: Connection closed` — the plugin's own idleMs, not
+// a client deadline (measured against the real SDK in review) — and so would any
+// per-agent call longer than idleMs: a build, a test run, a slow push, a wait.
+//
+// These pin the fix: an in-flight call is never closed under, and the connection
+// still closes idleMs after it settles.
+
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+test('a per-agent call that outlives idleMs survives, and the connection closes after it settles', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  fixtureState.toolCallDelayMs = 150
+  const ctx = stubCtx()
+  await mountPerAgent(ctx, { idleMs: 60 })
+  try {
+    // Watch the whole call, not one instant: an idle close fired at idleMs (60 ms)
+    // would otherwise land between two assertions and look like success.
+    let closesDuringCall = 0
+    const watcher = setInterval(() => {
+      if (clients.at(-1)?.closed === true || instances.at(-1)?.closed === true) closesDuringCall += 1
+    }, 5)
+    const pending = ctx.handlers['tools/execute']({
+      name: 'mcp__plumb__read_file',
+      arguments: { path: 'slow.go' },
+      ...conversation('conv-slow', '/w/slow')
+    }, async () => 'shared')
+
+    await sleepMs(110)
+    const client = clients.at(-1)
+    const transport = instances.at(-1)
+    assert.equal(closesDuringCall, 0, 'nothing closed the connection while the call was in flight')
+    assert.equal(client.closed, false)
+    assert.equal(transport.closed, false)
+
+    await pending // the call completes even though it outlived idleMs
+    clearInterval(watcher)
+    assert.equal(closesDuringCall, 0, 'still nothing closed it')
+    const sent = toolCalls.filter((entry) => entry.name === 'read_file')
+    assert.equal(sent.length, 1, 'it went over the agent’s own connection, once')
+
+    await sleepMs(140)
+    assert.equal(client.closed, true, 'the connection closes idleMs after the call settles')
+    assert.equal(transport.closed, true)
+  } finally {
+    fixtureState.toolCallDelayMs = 0
+    await ctx.handlers.dispose?.()
+  }
+})
 test('fallback: the declaration is normalised but carries no proof', async () => {
   process.env.DSH_HOME = fixtureDshHome
   resetFixture()

@@ -844,13 +844,22 @@ export async function apply (ctx, config) {
   }
 
   /**
-   * Mark a connection as just used and arm its idle close. The timer is
-   * unref'd, so it can never be the reason the host process stays alive — that
-   * would defeat its purpose.
+   * Mark a connection as just used and arm its idle close — but NEVER while a
+   * call is in flight. The timer closes the client that call is waiting on,
+   * which is exactly how a 40 s `check_messages` wait became `MCP error -32000:
+   * Connection closed` at ~15 s: the plugin's own `idleMs`, not a client
+   * deadline. (morning-moose's PLAN-516 review measured it against the real SDK:
+   * the same wait survives 40 s with no close, and dies at the close every
+   * time.) Every per-agent call longer than `idleMs` was being killed the same
+   * way — a build, a test run, a slow push.
+   *
+   * The timer is unref'd, so it can never be the reason the host process stays
+   * alive — that would defeat its purpose.
    */
   function touch (key, entry) {
     entry.lastUsed = Date.now()
     if (!(cfg.idleMs > 0)) return
+    if ((entry.inFlight ?? 0) > 0) return // re-armed by releaseIdle when it settles
     if (entry.idleTimer !== undefined) clearTimeout(entry.idleTimer)
     entry.idleTimer = setTimeout(() => {
       if (connections.get(key) !== entry) return
@@ -861,11 +870,32 @@ export async function apply (ctx, config) {
     entry.idleTimer.unref?.()
   }
 
-  /** Keep the registry bounded; close the least recently used excess. */
+  /** Hold a connection open for the duration of one call. */
+  function holdIdle (entry) {
+    entry.inFlight = (entry.inFlight ?? 0) + 1
+    if (entry.idleTimer !== undefined) {
+      clearTimeout(entry.idleTimer)
+      entry.idleTimer = undefined
+    }
+  }
+
+  /** Release it: once the last call has settled, the idle timer is armed again. */
+  function releaseIdle (key, entry) {
+    entry.inFlight = Math.max(0, (entry.inFlight ?? 1) - 1)
+    if (entry.inFlight === 0) touch(key, entry)
+  }
+
+  /**
+   * Keep the registry bounded; close the least recently used excess. A busy entry
+   * is never a candidate, so the registry can sit ABOVE `maxConnections` while
+   * every entry has a call in flight — the correct failure mode: closing under a
+   * call is the bug this exists to avoid (PLAN-516), and the excess is retired as
+   * each call settles.
+   */
   function evictConnections () {
     if (connections.size <= cfg.maxConnections) return
     const candidates = [...connections.entries()]
-      .filter(([, entry]) => entry.client !== undefined)
+      .filter(([, entry]) => entry.client !== undefined && (entry.inFlight ?? 0) === 0)
       .sort((a, b) => (a[1].lastUsed ?? 0) - (b[1].lastUsed ?? 0))
     while (connections.size > cfg.maxConnections && candidates.length > 0) {
       const [key, entry] = candidates.shift()
@@ -893,7 +923,7 @@ export async function apply (ctx, config) {
     const existing = connections.get(key)
     if (existing !== undefined) return existing.promise
 
-    const entry = { lastUsed: Date.now() }
+    const entry = { lastUsed: Date.now(), inFlight: 0 }
     entry.promise = (async () => {
       if (classes === null || classes === undefined) throw new Error('per-agent connection classes are unavailable')
       debug('connecting', key, 'cwd=' + agentContext.workspace, 'command=' + resolvePlumbCommand(cfg, process.env))
@@ -1023,11 +1053,21 @@ export async function apply (ctx, config) {
       if (Object.keys(proof).length > 0) args = { ...args, ...proof }
     }
 
-    const call = await entry.client.callTool(
-      { name: rawName, arguments: args },
-      resultSchema ?? undefined,
-      exec.signal === undefined ? undefined : { signal: exec.signal }
-    )
+    // The idle timer must not run under a call: it closes the client this call
+    // is waiting on (see touch). Held for the whole dispatch and released in the
+    // finally, so a call that outlives idleMs survives and the connection closes
+    // idleMs after it settles.
+    holdIdle(entry)
+    let call
+    try {
+      call = await entry.client.callTool(
+        { name: rawName, arguments: args },
+        resultSchema ?? undefined,
+        exec.signal === undefined ? undefined : { signal: exec.signal }
+      )
+    } finally {
+      releaseIdle(agentContext.sessionId, entry)
+    }
 
     debug('dispatched', rawName)
     const content = Array.isArray(call?.content) ? call.content : []
