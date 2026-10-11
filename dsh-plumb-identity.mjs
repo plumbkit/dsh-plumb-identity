@@ -71,6 +71,18 @@
 // step with plumb's identity layer. (The one thing it does share with plumb is
 // the resume proof's argument names, below.)
 //
+// What that depends on is ONE linkage per connection (PLAN-510). plumb reads an
+// unstamped `session_start` naming another id as the client handing the
+// connection over: it replaces the identity row's linkage, which revokes the
+// resume credential hanging on it, and a second logical agent on one serve arms
+// the very shared-connection gate this mode exists to avoid. A model that
+// follows `~/.dsh/AGENTS.md` and declares a session_id of its own does exactly
+// that — measured on 2026-10-11, the credential was revoked 48 ms after it was
+// issued and every reconnect after it resumed by name only. So `prepareCall`
+// takes a typed id over before dispatch (`normaliseSessionStart`, mirroring
+// plumb's own Claude Code identity hook,
+// internal/cli/hooks_claude_identity.go:117-130), on both dispatch paths.
+//
 // Two rules keep it strictly better than the shared path:
 //
 //   * It only ever falls back BEFORE dispatch — an unreachable per-agent
