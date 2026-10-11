@@ -952,6 +952,7 @@ test('resumeProofFields keeps only the stamp and the proof, for exactly this id'
   assert.equal(resumeProofFields('x', out({ session_id: 'x', plumb_agent: 'x', plumb_hook_proof: 7 })), null, 'a proof that is not a string')
   assert.equal(resumeProofFields('x', out({ session_id: 'y', plumb_agent: 'y', plumb_hook_proof: 'p' })), null, "another id's proof")
   assert.equal(resumeProofFields('x', out({ session_id: 'x', plumb_agent: 'y', plumb_hook_proof: 'p' })), null, 'a stamp for another id')
+  assert.equal(resumeProofFields('x', out({ session_id: 'y', plumb_agent: 'x', plumb_hook_proof: 'p' })), null, 'a session_start the hook re-pointed at another id')
   assert.equal(resumeProofFields('x', out({ session_id: 'x', plumb_hook_proof: 'p' })), null, 'a proof with no stamp')
 })
 
