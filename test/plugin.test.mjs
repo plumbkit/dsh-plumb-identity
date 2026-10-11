@@ -14,7 +14,8 @@ const fixtureSdkUrl = new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@mo
 
 const {
   name, inject, defaultConfig, resolveAgentContext, mintIdentity, shouldSkip, apply, resolvePlumbCommand, mcpContentText, refusesMailPreview,
-  resumeProofArgs, resumeProofRequest, resumeProofFields, resumeProofEnv, runResumeProof
+  resumeProofArgs, resumeProofRequest, resumeProofFields, resumeProofEnv, runResumeProof,
+  normaliseSessionStart
 } = await import(pluginUrl)
 const { requests, toolCalls, clients, fixtureState, Client } = await import(fixtureSdkUrl)
 const { spawned, instances } = await import(new URL('./fixtures/dshhome/.dsh/profiles/node_modules/@modelcontextprotocol/sdk/dist/esm/client/stdio.js', import.meta.url).href)
@@ -126,7 +127,8 @@ test('defaultConfig carries the documented defaults', () => {
     maxConnections: 16,
     idleMs: 15_000,
     resumeProof: true,
-    resumeProofTimeoutMs: 5_000
+    resumeProofTimeoutMs: 5_000,
+    normaliseDeclarations: true
   })
 })
 
@@ -1080,6 +1082,132 @@ test('per-agent connection: each connection proves its own agent, and the mail f
     assert.deepEqual(declares.map((call) => call.arguments.session_id), ['dsh-w-pf-conv-pf-a', 'dsh-w-pf-conv-pf-a', 'dsh-w-pf-conv-pf-b'])
   } finally {
     fixtureState.sessionStartRefusals = []
+    await ctx.handlers.dispose?.()
+  }
+})
+
+// -- PLAN-510: one linkage per connection -------------------------------------
+//
+// The live failure these pin: on 2026-10-11 a DSH agent followed its brief and
+// declared its own session_id on a connection whose proven id was the plugin's,
+// which replaced the linkage, revoked the resume credential 48 ms after it was
+// issued, and marked the connection shared (every state-changing call refused).
+// Every reconnect after that resumed by name only, so bound mail stranded.
+
+test('normaliseSessionStart takes over a typed declaration, and leaves a matching one alone', () => {
+  assert.equal(normaliseSessionStart({ session_id: 'mine', workspace: '/w' }, 'mine'), null,
+    'a declaration that already names this connection’s id is a no-op')
+  assert.equal(normaliseSessionStart(null, 'x'), null)
+  assert.equal(normaliseSessionStart([], 'x'), null)
+  assert.equal(normaliseSessionStart('session_id=x', 'x'), null)
+
+  assert.deepEqual(
+    normaliseSessionStart({
+      session_id: 'typed-by-the-model',
+      workspace: '/w/re-pin',
+      purpose: 'review',
+      detail: 'brief',
+      mail: 'preview'
+    }, 'dsh-w-conv-a'),
+    { session_id: 'dsh-w-conv-a', workspace: '/w/re-pin', purpose: 'review', detail: 'brief', mail: 'preview' },
+    'only the id changes: an intentional re-pin, the purpose, the detail and mail survive'
+  )
+
+  assert.deepEqual(
+    normaliseSessionStart({
+      session_id: 'dsh-w-conv-a',
+      plumb_agent: 'phantom',
+      'dev.plumbkit/logical-agent': 'phantom',
+      plumb_hook_proof: 'typed-by-the-model'
+    }, 'dsh-w-conv-a'),
+    { session_id: 'dsh-w-conv-a' },
+    'a typed stamp or proof is dropped even when the id already matches'
+  )
+})
+
+test('per-agent connection: a model-typed session_id is normalised to the proven id, with the proof', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    let forwarded = false
+    await ctx.handlers['tools/execute']({
+      name: 'mcp__plumb__session_start',
+      arguments: { session_id: 'dsh-plumb-ops-r4t9', workspace: '/w/one', probe: 'model-call' },
+      ...conversation('conv-one', '/w/one')
+    }, async () => { forwarded = true; return 'shared' })
+    assert.equal(forwarded, false, 'the call was served by the agent’s own connection')
+
+    const declares = toolCalls.filter((call) => call.name === 'session_start')
+    const mine = declares.find((call) => call.arguments.probe === 'model-call')
+    assert.ok(mine, 'the call reached the agent’s own connection')
+    assert.equal(mine.arguments.session_id, 'dsh-w-one-conv-one', 'the typed id is replaced by the proven one')
+    assert.equal(mine.arguments.workspace, '/w/one', 'the workspace is left as typed')
+    assert.equal(mine.arguments.probe, 'model-call', 'nothing else about the call changes')
+    assert.equal(mine.arguments.plumb_agent, 'dsh-w-one-conv-one')
+    assert.equal(mine.arguments.plumb_hook_proof, 'proof-of-dsh-w-one-conv-one',
+      'the per-agent path proves the declaration (the fallback control is below)')
+
+    const reported = ctx.logs.filter(([level, msg]) => level === 'info' && msg.includes('normalised to it'))
+    assert.equal(reported.length, 1, 'reported, once')
+    assert.match(reported[0][1], /declared session_id dsh-plumb-ops-r4t9/)
+
+    await ctx.handlers['tools/execute']({
+      name: 'mcp__plumb__session_start',
+      arguments: { session_id: 'dsh-w-one-conv-one' },
+      ...conversation('conv-one', '/w/one')
+    }, async () => 'shared')
+    assert.equal(ctx.logs.filter(([level, msg]) => level === 'info' && msg.includes('normalised to it')).length, 1,
+      'a declaration that already matches is not reported again')
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('only session_start is normalised: another call keeps its arguments exactly', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const ctx = stubCtx()
+  await mountPerAgent(ctx)
+  try {
+    await ctx.handlers['tools/execute']({
+      name: 'mcp__plumb__read_file',
+      arguments: { path: 'a.go' },
+      ...conversation('conv-keep', '/w/keep')
+    }, async () => 'shared')
+    const read = toolCalls.find((call) => call.name === 'read_file')
+    assert.deepEqual(read.arguments, { path: 'a.go' }, 'no session_id is injected into another tool')
+  } finally {
+    await ctx.handlers.dispose?.()
+  }
+})
+
+test('fallback: the declaration is normalised but carries no proof', async () => {
+  process.env.DSH_HOME = fixtureDshHome
+  resetFixture()
+  const ctx = stubCtx()
+  await mount(ctx) // perAgentConnection: false — the shared serve
+  try {
+    let forwarded = false
+    const exec = {
+      name: 'mcp__plumb__session_start',
+      arguments: { session_id: 'dsh-plumb-ops-r4t9', workspace: '/w/fb' },
+      ...conversation('conv-fb', '/w/fb')
+    }
+    await ctx.handlers['tools/execute'](exec, async () => { forwarded = true; return 'shared' })
+    assert.equal(forwarded, true, 'the shared fallback lets the harness send the call')
+    assert.equal(exec.arguments.session_id, 'dsh-w-fb-conv-fb', 'normalised on the fallback too')
+    assert.equal(exec.arguments.workspace, '/w/fb')
+    assert.equal('plumb_hook_proof' in exec.arguments, false,
+      'no proof on a multi-conversation serve: a serve process may link only ONE conversation (serve_resume.go claim())')
+    assert.equal('plumb_agent' in exec.arguments, false)
+
+    const declares = toolCalls.filter((call) => call.name === 'session_start')
+    for (const call of declares) {
+      assert.equal('plumb_hook_proof' in call.arguments, false, 'the plugin’s own fallback declaration is unproved by design')
+    }
+  } finally {
     await ctx.handlers.dispose?.()
   }
 })

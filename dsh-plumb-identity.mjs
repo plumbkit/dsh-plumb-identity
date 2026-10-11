@@ -161,7 +161,12 @@ export function defaultConfig () {
     resumeProof: true,
     // How long the child that computes the proof may take. Past it the
     // declaration goes out unproved, which is the name-only resume.
-    resumeProofTimeoutMs: 5_000
+    resumeProofTimeoutMs: 5_000,
+    // Take over a `session_start` whose arguments name a linkage of the model's
+    // own, so a connection carries exactly ONE (PLAN-510). The e2e red run sets
+    // it false; an escape hatch if a host ever needs the model's declaration
+    // passed through verbatim.
+    normaliseDeclarations: true
   }
 }
 
@@ -327,6 +332,47 @@ export function resumeProofFields (id, stdout) {
   const key = stampKeys.find((candidate) => updated[candidate] === id)
   if (key === undefined) return null
   return { [key]: id, [hookProofKey]: proof }
+}
+
+/**
+ * The one linkage a connection carries is the plugin's, not the model's.
+ *
+ * A `session_start` whose arguments name a different linkage REPLACES the
+ * connection's own and revokes its resume credential (plumb
+ * internal/cli/conn_resume_accept_test.go, 'Replacing the linkage revokes the
+ * credential'), and it registers a second logical agent on a connection that is
+ * meant to carry one — which arms plumb's anonymous-write gate. Observed live
+ * on 2026-10-11: the agent's brief-mandated declaration revoked the credential
+ * 48 ms after the connection established it, and every reconnect after that
+ * resumed by name only (a new plumb session each time, so bound mail stranded).
+ *
+ * So this mirrors the Claude Code identity hook (plumb
+ * internal/cli/hooks_claude_identity.go:117-130): a stamp or proof the model
+ * typed is dropped, and the id comes from the harness. Everything else the
+ * caller asked for — `workspace` (an intentional re-pin), `purpose`, `detail`,
+ * `mail` — is left exactly as typed. Returns null when there is nothing to
+ * change, so a declaration that already names this connection's id stays
+ * byte-for-byte as the model wrote it and is not logged.
+ */
+export function normaliseSessionStart (args, id) {
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return null
+  let changed = false
+  const next = { ...args }
+  for (const key of stampKeys) {
+    if (key in next) {
+      delete next[key]
+      changed = true
+    }
+  }
+  if (hookProofKey in next) {
+    delete next[hookProofKey]
+    changed = true
+  }
+  if (next.session_id !== id) {
+    next.session_id = id
+    changed = true
+  }
+  return changed ? next : null
 }
 
 /**
@@ -725,6 +771,9 @@ export async function apply (ctx, config) {
 
   const connections = new Map() // sessionId -> { promise, client, transport, toolNames, lastUsed }
   const connectionFaults = new Set()
+  // Agents whose typed session_start declaration was normalised, so the report
+  // is one line per agent rather than one per call.
+  const normalisedDeclarations = new Set()
   let connectionsClosed = false
   let capabilityNoted = false
   let resumeProofWarned = false
@@ -943,8 +992,23 @@ export async function apply (ctx, config) {
 
     touch(agentContext.sessionId, entry)
     debug('dispatch', rawName, 'over client for', agentContext.sessionId)
+
+    // The proof rides the session_start that names the conversation, not only
+    // the declaration this connection opened with: if that one could not be
+    // proved (hook too slow, key unreadable), this call is the second chance to
+    // link the conversation to a credential. It is deliberately NOT attached on
+    // the shared fallback: that serve carries many conversations, and plumb's
+    // claim() lets a serve process link exactly one for its whole life
+    // (internal/cli/serve_resume.go), so proving there would bar every other
+    // agent on it and file a credential it can never present.
+    let args = exec.arguments ?? {}
+    if (rawName === 'session_start') {
+      const proof = await resumeProofFor(ident)
+      if (Object.keys(proof).length > 0) args = { ...args, ...proof }
+    }
+
     const call = await entry.client.callTool(
-      { name: rawName, arguments: exec.arguments ?? {} },
+      { name: rawName, arguments: args },
       resultSchema ?? undefined,
       exec.signal === undefined ? undefined : { signal: exec.signal }
     )
@@ -985,13 +1049,30 @@ export async function apply (ctx, config) {
       }
       return null
     }
-    return {
-      agentContext,
-      ident: {
-        id: mintIdentity({ prefix: cfg.idPrefix, workspace: agentContext.workspace, sessionId: agentContext.sessionId }),
-        workspace: agentContext.workspace
-      }
+    const ident = {
+      id: mintIdentity({ prefix: cfg.idPrefix, workspace: agentContext.workspace, sessionId: agentContext.sessionId }),
+      workspace: agentContext.workspace
     }
+
+    // One linkage per connection (PLAN-510). Only a session_start declares a
+    // linkage, so only a session_start is touched — every other call's
+    // arguments are none of this function's business. Both dispatch paths read
+    // the arguments from here (the per-agent connection sends them, and the
+    // shared fallback's pipeline does), so normalising once covers both; the
+    // proof asymmetry between those paths is in routeOverOwnConnection.
+    const normalised = cfg.normaliseDeclarations !== false && toolName === `${prefix}session_start`
+      ? normaliseSessionStart(exec.arguments, ident.id)
+      : null
+    if (normalised !== null) {
+      debug('normalised a typed session_start declaration', ident.id)
+      if (!normalisedDeclarations.has(agentContext.sessionId)) {
+        normalisedDeclarations.add(agentContext.sessionId)
+        ctx.logger?.info?.(`${name}: ${agentContext.sessionId} declared session_id ${String(exec.arguments?.session_id)}; this connection carries ${ident.id} (proven), so the declaration is normalised to it — one linkage per connection, or the reconnect resume is revoked (PLAN-510)`)
+      }
+      exec.arguments = normalised
+    }
+
+    return { agentContext, ident }
   }
 
   ctx.on('tools/execute', async (exec, next) => {

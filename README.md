@@ -121,8 +121,9 @@ Six scenarios:
 - `per-agent` — the agent and a subagent both call plumb; each must get its own connection, declared on itself, and the shared connection must carry no declaration.
 - `mail` — a note is left for "whoever attaches next" before the agent's first plumb call; the model must receive it from `check_messages` exactly once. This is the regression test for the automatic `session_start` consuming mail. Remove `mail: "preview"` from the plugin and it fails with "claimed where the model cannot see it".
 - `reconnect` — a note is sent to the agent WHILE it is connected, its own connection then idle-closes (an 8 s `idleMs`; the fake model is held between its two calls until plumb records the end), and the model's `check_messages` runs over a new connection. The note must arrive exactly once and the agent's declared session id must not change. The red control is `E2E_RESUME_PROOF=0 node test/e2e-mock-provider.mjs --mode reconnect`, which mounts the plugin with `resumeProof: false` and must FAIL with the note "stranded on session …" and a second session id.
+- `declared-id` — the `reconnect` steps plus a `session_start` the MODEL declares with a `session_id` and `workspace` of its own, which is what the brief tells a DSH agent to do. Exactly one linkage must survive: no record may carry the typed id, no connection may be marked `shared_connection_detected`, the daemon must not log a shared connection, and the note must still arrive exactly once with the session id unchanged. The red control is `E2E_NORMALISE=0 node test/e2e-mock-provider.mjs --mode declared-id`, which mounts the plugin with `normaliseDeclarations: false` and must FAIL with "the daemon reported a shared connection".
 
-The first four assert on plumb's own session records; `mail` asserts on the tool results the fake model was actually sent, and `reconnect` on both. Every scenario stops its own isolated plumb daemon on the way out, found by the pidfile under its temp `HOME` (never a process-wide sweep), on pass and on fail. A daemon that survives fails the scenario.
+The first four assert on plumb's own session records; `mail` asserts on the tool results the fake model was actually sent, and `reconnect` and `declared-id` on both. Every scenario stops its own isolated plumb daemon on the way out, found by the pidfile under its temp `HOME` (never a process-wide sweep), on pass and on fail. A daemon that survives fails the scenario.
 
 Requirements: a `dsh` install (resolved from `$DSH_BIN`, else the `$DSH_HOME` / `~/.dsh` profile tree, exactly what dsh itself resolves) and a plumb binary (`$PLUMB_BIN`, else `../plumb/plumb` beside this checkout, else `plumb` on PATH). Run one scenario with `node test/e2e-mock-provider.mjs --mode subagent`; keep the temp dirs for debugging with `--keep` or `E2E_KEEP=1`.
 
@@ -149,6 +150,10 @@ confused for each other.
   the agent's SAME plumb session, so mail bound to it survives (below).
 - `resumeProofTimeoutMs` (default 5 s) bounds the hook that computes the proof;
   a value that is not a positive number falls back to the default.
+- `normaliseDeclarations` (default `true`) takes over a `session_start` whose
+  arguments name a linkage of the model's own, so a connection carries exactly
+  ONE (below). `false` passes the model's id through verbatim — the e2e red
+  control, and an escape hatch.
 - `PLUMB_IDENTITY_DEBUG=1` traces the connection lifecycle to stderr.
 
 ### Reconnects keep the plumb session (resume proof)
@@ -189,9 +194,42 @@ for that hook, is not passed to it: here it is asked for a proof, not to stamp
 a model's call. The shared-connection fallback never sends a proof: one serve
 carries many agents there, and its credential is not any one agent's.
 
+### One linkage per connection (a declared id is taken over)
+
+`~/.dsh/AGENTS.md` tells every DSH conversation to declare a `session_id`, and a
+model that follows it calls `session_start` with an id of its own. That is a
+SECOND linkage on a connection that already carries the plugin's proven one, and
+plumb's rules for it are strict: an unstamped `session_start` naming another
+linkage hands the connection over — `SaveIdentity` replaces the identity row's
+`external_id`, which **revokes the resume credential** hanging on it — and two
+logical agents on one serve make it a *shared connection*, where an
+unattributable state-changing call is refused.
+
+Measured live on 2026-10-11, before this was handled: the agent's declaration
+arrived 79 ms after the plugin's, the credential was revoked 48 ms later, and
+every reconnect after that resumed by name only — seven session ids in seven
+minutes, the note bound to each one stranded, and `check_messages`/`git` refused
+on the connection that carried both ids.
+
+So the plugin takes the id over, exactly as Claude Code's identity hook does
+(`plumb/internal/cli/hooks_claude_identity.go`): a `session_id` the model typed
+is replaced with the connection's proven id, a stamp or `plumb_hook_proof` it
+typed is dropped, and everything else it asked for — `workspace` (an intentional
+re-pin), `purpose`, `detail`, `mail` — is passed through untouched. The takeover
+is reported once per agent in the DSH log, naming both ids.
+
+The per-agent connection also carries the resume proof on that declaration, not
+only on the one it opened with: if the opening declaration could not be proved,
+this is the second chance to link the conversation to a credential. The
+shared-connection fallback keeps its declaration unproved, here and everywhere:
+one serve carries many conversations, and plumb's `claim()` lets a serve process
+link exactly ONE conversation for its whole life, so proving there would bar
+every other agent on that connection and file a credential it could never
+present.
+
 ## Interplay notes
 
-- A model that follows `~/.dsh/AGENTS.md` and calls `session_start` with its own id changes nothing: the per-call `_meta` stamp wins plumb's identity resolution, so the conversation stays under its minted id. Keep the AGENTS.md rules — they are the fallback when the plugin is absent and the path through which the model receives plumb's orientation packet.
+- A model that follows `~/.dsh/AGENTS.md` and calls `session_start` with its own id is handled, not obeyed: the plugin rewrites that id to the connection's proven one (above). Before that takeover it was neither harmless nor obeyed — on a per-agent connection the call is dispatched outside the identity scope, so the per-call `_meta` stamp is NOT on it and plumb read the typed id as a second linkage, revoking the resume credential and stranding bound mail. Keep the AGENTS.md rules: they are the fallback when the plugin is absent and the path through which the model receives plumb's orientation packet.
 - A plumb connection keeps ONE session record; `external_id`/`purpose` in `plumb sessions` show the most recent declarer on that connection. Per-agent isolation is plumb's shard state (`pinned_workspace`/`read_tracking` keyed by `logical_agent_id`), not the session record.
 - Single-identity connections pin at connection level by design ("one declared id arms nothing"); sharding and per-agent pins engage from the second distinct identity, which is exactly the multi-workspace web case.
 - **The automatic `session_start` previews mail; it must never claim it.** plumb's `session_start` defaults to `mail: "claim"`, which delivers waiting notes exactly once, into its orientation packet. DSH consumes that packet without showing it to the model, so a claim there loses the note: it is gone from `check_messages` before the model can ask. The plugin therefore sends `mail: "preview"` (plumb >= 0.24.0) on both declaration paths. **plumb < 0.24** doesn't know the argument, and its argument guard refuses the whole call with `session_start: unknown parameter "mail"`. On exactly that refusal the plugin re-sends the declaration once without `mail`, remembers it for that client, and warns once that mail is being claimed again. Upgrading plumb is the fix. Any other refusal is handled as below.

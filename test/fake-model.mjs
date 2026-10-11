@@ -25,6 +25,12 @@
 //     The harness uses the pause to send a note to the connected agent and wait
 //     for its plumb connection to idle-close, so check_messages runs over a
 //     NEW connection (PLAN-510).
+//   - `declared-id` — the `reconnect` steps plus a `session_start` the MODEL
+//     declares with a session_id of its own, which is what a DSH agent
+//     following its brief does. The plugin must take that id over: a second
+//     linkage on the connection replaces the proven one, revokes the resume
+//     credential, marks the connection shared and strands the bound note
+//     (PLAN-510).
 //
 // The tool to call is read from the request's own `tools[]` (matched by name
 // shape, never hardcoded), and arguments are filled generically from the
@@ -41,21 +47,28 @@ const CANNED_TASK = 'Use the mcp__plumb__daemon_info tool once, then reply with 
 /** The text answer for every non-tool-call turn. */
 const FINAL_TEXT = 'done'
 
+/**
+ * The session_id `declared-id` types for itself: deliberately the shape a DSH
+ * agent's brief invites (`dsh-<workspace>-<suffix>`) and NOT the plugin's minted
+ * one, because that mismatch is the bug — plumb reads it as a second linkage.
+ */
+export const TYPED_SESSION_ID = 'dsh-e2e-model-choice'
+
 /** Plausible non-zero usage: dsh's token meter reads these fields. */
 const USAGE = { prompt_tokens: 11, completion_tokens: 5, total_tokens: 16 }
 
-export const FAKE_MODEL_MODES = ['tool-call', 'text-only', 'subagent', 'per-agent', 'mail', 'reconnect']
+export const FAKE_MODEL_MODES = ['tool-call', 'text-only', 'subagent', 'per-agent', 'mail', 'reconnect', 'declared-id']
 
 /**
  * Start the fake model on an ephemeral 127.0.0.1 port.
- * @param {{mode?: string, log?: (line: string) => void, beforeCheckMessages?: () => Promise<void>}} options
+ * @param {{mode?: string, log?: (line: string) => void, beforeCheckMessages?: () => Promise<void>, workspace?: string}} options
  * @returns {Promise<{url: string, port: number, requests: string[], close: () => Promise<void>}>}
  */
-export function createFakeModel({ mode = 'tool-call', log = () => {}, beforeCheckMessages } = {}) {
+export function createFakeModel({ mode = 'tool-call', log = () => {}, beforeCheckMessages, workspace } = {}) {
   if (!FAKE_MODEL_MODES.includes(mode)) {
     throw new Error(`fake-model: unknown mode "${mode}" (expected one of ${FAKE_MODEL_MODES.join(', ')})`)
   }
-  const state = { spawns: 0, requests: [], toolResults: [], seenToolResults: new Set(), beforeCheckMessages, gated: null }
+  const state = { spawns: 0, requests: [], toolResults: [], seenToolResults: new Set(), beforeCheckMessages, workspace, gated: null }
   const server = http.createServer((req, res) => {
     collectBody(req)
       .then((body) => route(req, res, body, mode, state, log))
@@ -108,7 +121,7 @@ function route(req, res, body, mode, state, log) {
   // `reconnect`: hold the check_messages reply, once, until the harness is
   // done with the connected agent. Every request that would make that call
   // waits on the same gate, so a retried request cannot slip past it.
-  if (mode === 'reconnect' && state.beforeCheckMessages && decide(parsed, mode, state).id === 'call_e2e_mail') {
+  if ((mode === 'reconnect' || mode === 'declared-id') && state.beforeCheckMessages && decide(parsed, mode, state).id === 'call_e2e_mail') {
     state.gated ??= Promise.resolve().then(state.beforeCheckMessages)
     return state.gated
       .then(() => respond(res, parsed, mode, state))
@@ -139,6 +152,7 @@ function decide(parsed, mode, state) {
   // `mail` decides by which tools the conversation has already called, so the
   // tool-result short-circuit below must not apply to it.
   if (mode === 'mail' || mode === 'reconnect') return decideMail(parsed, messages)
+  if (mode === 'declared-id') return decideDeclaredId(parsed, messages, state)
   // `per-agent` decides on BOTH request shapes — the opening turn calls plumb,
   // the follow-up delegates — so it must not be short-circuited here.
   if (mode === 'text-only' || (hasToolResult && mode !== 'per-agent')) return { kind: 'text' }
@@ -191,6 +205,40 @@ function decideMail(parsed, messages) {
     const tool = tools.find((entry) => pattern.test(entry.name))
     if (!tool) return { kind: 'text' }
     return { kind: 'tool', name: tool.name, args: fillArguments(tool), id }
+  }
+  return { kind: 'text' }
+}
+
+/**
+ * `declared-id`: `mail`'s steps with the model's own declaration in between —
+ * daemon_info (whose first call makes the plugin declare the agent on its own
+ * connection), then a session_start carrying TYPED_SESSION_ID, then
+ * check_messages, then text. The declaration IS the experiment, so its argument
+ * is fixed rather than filled from the tool's schema.
+ */
+function decideDeclaredId(parsed, messages, state) {
+  const tools = (Array.isArray(parsed.tools) ? parsed.tools : [])
+    .map((entry) => entry?.function ?? (typeof entry?.name === 'string' ? entry : null))
+    .filter(Boolean)
+  const called = calledToolNames(messages)
+  // The brief tells a DSH agent to pass its workspace alongside the id, and
+  // THAT is what makes plumb hand the connection over: SaveIdentity replaces the
+  // identity row's external linkage, and replacing it revokes the resume
+  // credential (sessionstate TestSaveIdentity_ReplacingTheLinkageRevokes).
+  // Without the workspace the declaration registers a second agent but never
+  // replaces the linkage, so the red control would not bite.
+  const declared = { session_id: TYPED_SESSION_ID }
+  if (typeof state.workspace === 'string' && state.workspace.length > 0) declared.workspace = state.workspace
+  const steps = [
+    [/daemon_info$/, 'call_e2e_info'],
+    [/session_start$/, 'call_e2e_declare', declared],
+    [/check_messages$/, 'call_e2e_mail']
+  ]
+  for (const [pattern, id, fixed] of steps) {
+    if (called.some((toolName) => pattern.test(toolName))) continue
+    const tool = tools.find((entry) => pattern.test(entry.name))
+    if (!tool) return { kind: 'text' }
+    return { kind: 'tool', name: tool.name, args: fixed ?? fillArguments(tool), id }
   }
   return { kind: 'text' }
 }

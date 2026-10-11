@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createFakeModel } from './fake-model.mjs'
+import { createFakeModel, TYPED_SESSION_ID } from './fake-model.mjs'
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PLUGIN_FILE = path.join(REPO_ROOT, 'dsh-plumb-identity.mjs')
@@ -150,31 +150,101 @@ const SCENARIOS = {
     // gate opens as the first call returns), short enough to keep the run quick.
     idleMs: 8_000,
     gate: noteWhileConnectedThenReconnect,
-    expect: async ({ root, fake, gate }) => {
-      if (gate.error) return `the reconnect was never staged: ${gate.error}`
-      if (!gate.ended) return 'the gate never ran, so no reconnect was staged'
-      // The positive control: check_messages went over a SECOND connection.
-      // Each connection leaves a record, resumed or not, so one is a run in
-      // which nothing reconnected and the rest of this proves nothing.
-      const connections = readSessionRecords({ root }).filter((r) => r.clientName === 'dsh-plumb-identity')
-      if (connections.length < 2) return `expected the agent to reconnect (two own connections), found ${connections.length}`
-      const results = fake.toolResults
-      if (!results.some((r) => /check_messages$/.test(r.name ?? ''))) {
-        return `the model never received a check_messages result (tool results: ${results.map((r) => r.name).join(', ') || 'none'})`
-      }
-      const hits = results.flatMap((r) => Array(r.content.split(gate.marker).length - 1).fill(r.name))
-      const ids = [...new Set(agentRecords({ root }).map((r) => r.id))]
-      if (hits.length === 0) {
-        return `the note sent while the agent was connected never reached it after the reconnect: stranded on session ${gate.sessionId} (agent session ids seen: ${ids.join(', ')})`
-      }
-      if (hits.length > 1) return `the note reached the model ${hits.length} times (${hits.join(', ')}), expected exactly once`
-      if (!/check_messages$/.test(hits[0] ?? '')) return `the note reached the model through ${hits[0]}, not check_messages`
-      if (ids.length !== 1 || ids[0] !== gate.sessionId) {
-        return `the agent's plumb session id changed across the reconnect: ${gate.sessionId} -> ${ids.join(', ')}`
-      }
-      return null
+    expect: expectNoteSurvivedReconnect,
+  },
+  // PLAN-510's live failure, reproduced: the agent follows its brief and
+  // declares a session_id of its own (fake-model's `declared-id` mode) on a
+  // connection whose proven identity is the plugin's. Before normalisation that
+  // REPLACED the linkage — the resume credential was revoked 48 ms after it was
+  // issued, the connection was marked shared (every state-changing call on it
+  // refused), and every reconnect after it resumed by name only, so the note
+  // bound to the old id stranded. With normalisation the typed id is taken over
+  // and the run behaves exactly like `reconnect`.
+  // Control: E2E_NORMALISE=0 mounts the plugin with `normaliseDeclarations:
+  // false`, and this scenario must FAIL.
+  'declared-id': {
+    task: 'Use the mcp__plumb__session_start tool once with a session_id of your own choosing, then the mcp__plumb__daemon_info tool once, then the mcp__plumb__check_messages tool once, then reply with exactly: done',
+    idleMs: 8_000,
+    gate: noteWhileConnectedThenReconnect,
+    expect: async (ctx) => {
+      const typed = declaredIdWasTakenOver(ctx)
+      if (typed !== null) return typed
+      return expectNoteSurvivedReconnect(ctx)
     },
   },
+}
+
+/**
+ * The assertions PLAN-510's two scenarios share: the agent reconnected over a
+ * SECOND own connection, the note sent while it was connected arrived exactly
+ * once through check_messages, and its plumb session id is the same on both
+ * sides of the reconnect.
+ */
+async function expectNoteSurvivedReconnect({ root, fake, gate }) {
+  if (gate.error) return `the reconnect was never staged: ${gate.error}`
+  if (!gate.ended) return 'the gate never ran, so no reconnect was staged'
+  // The positive control: check_messages went over a SECOND connection. Each
+  // connection leaves a record, resumed or not, so one connection is a run in
+  // which nothing reconnected and the rest of this proves nothing.
+  const connections = readSessionRecords({ root }).filter((r) => r.clientName === 'dsh-plumb-identity')
+  if (connections.length < 2) return `expected the agent to reconnect (two own connections), found ${connections.length}`
+  const results = fake.toolResults
+  if (!results.some((r) => /check_messages$/.test(r.name ?? ''))) {
+    return `the model never received a check_messages result (tool results: ${results.map((r) => r.name).join(', ') || 'none'})`
+  }
+  const hits = results.flatMap((r) => Array(r.content.split(gate.marker).length - 1).fill(r.name))
+  const ids = [...new Set(agentRecords({ root }).map((r) => r.id))]
+  if (hits.length === 0) {
+    return `the note sent while the agent was connected never reached it after the reconnect: stranded on session ${gate.sessionId} (agent session ids seen: ${ids.join(', ')})`
+  }
+  if (hits.length > 1) return `the note reached the model ${hits.length} times (${hits.join(', ')}), expected exactly once`
+  if (!/check_messages$/.test(hits[0] ?? '')) return `the note reached the model through ${hits[0]}, not check_messages`
+  if (ids.length !== 1 || ids[0] !== gate.sessionId) {
+    return `the agent's plumb session id changed across the reconnect: ${gate.sessionId} -> ${ids.join(', ')}`
+  }
+  return null
+}
+
+/**
+ * `declared-id` only: the id the MODEL typed must never become a declared
+ * linkage, and it must not mark the connection shared. Both are the live
+ * symptoms beside the stranded note — on 2026-10-11 the credential was revoked
+ * 48 ms after it was issued and every state-changing call on that connection
+ * was refused.
+ */
+function declaredIdWasTakenOver({ root }) {
+  const records = readSessionRecords({ root })
+  const typed = records.filter((r) => r.externalId === TYPED_SESSION_ID)
+  if (typed.length > 0) {
+    return `the model's own session_id (${TYPED_SESSION_ID}) became a declared linkage on ${typed.length} record(s) — two logical agents on one connection`
+  }
+  const marked = records.filter((r) => r.health === 'shared_connection_detected')
+  if (marked.length > 0) {
+    return `the typed declaration marked ${marked.length} connection(s) shared_connection_detected, where anonymous state-changing calls are refused: ${marked.map((r) => r.id).join(', ')}`
+  }
+  // What the DAEMON saw, which is the sharpest form of the same fact: a second
+  // logical agent on one connection is exactly what makes it log the shared
+  // connection warning. That is the symptom an isolated run can observe
+  // deterministically — in production the same declaration also replaces the
+  // identity row's linkage and revokes the resume credential (observed live
+  // 2026-10-11), but whether the daemon ADOPTS a second linkage or merely
+  // registers it depends on its roster/owner rules, which a scripted model does
+  // not reach. Matched on the message, not the agent id: the line prints the id
+  // through plumb's abbreviating label, so the full id is not in it.
+  const daemonLog = readDaemonLog(root)
+  if (daemonLog.includes('shared connection detected')) {
+    return 'the daemon reported a shared connection: the model\'s typed declaration registered a second logical agent on it'
+  }
+  return null
+}
+
+/** The isolated daemon's own log, or '' before it has written one. */
+function readDaemonLog(root) {
+  for (const dir of walkDirs(path.join(root, 'plumbhome'), 0)) {
+    const file = path.join(dir, 'daemon.log')
+    if (fs.existsSync(file)) return fs.readFileSync(file, 'utf8')
+  }
+  return ''
 }
 
 main().catch((error) => {
@@ -221,15 +291,18 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
   let runGate = null
   console.log(`\n=== ${mode} ===`)
   try {
+    // Before the fake model: `declared-id` declares a workspace with its typed
+    // session_id, the way the brief tells a DSH agent to (see decideDeclaredId).
+    const workspace = path.join(root, 'workspace')
     fake = await createFakeModel({
       mode,
       log: (line) => console.log(`  ${line}`),
       beforeCheckMessages: scenario.gate ? () => runGate() : undefined,
+      workspace,
     })
     const plumbSh = writePlumbWrapper({ root, plumbBin })
     const idleMs = scenario.idleMs ?? Number(process.env.E2E_IDLE_MS ?? 60000)
     const home = buildDshHome({ root, fakeUrl: fake.url, plumbSh, hoisted: harness.hoisted, idleMs })
-    const workspace = path.join(root, 'workspace')
     fs.mkdirSync(workspace, { recursive: true })
     const setup = scenario.setup ? await scenario.setup({ workspace, plumbSh }) : {}
     if (scenario.gate) {
@@ -471,6 +544,10 @@ llm-pi-ai:
         # E2E_RESUME_PROOF=0 declares without plumb's resume proof: the
         # control that proves the reconnect scenario fails without it.
         resumeProof: ${process.env.E2E_RESUME_PROOF === '0' ? 'false' : 'true'}
+        # E2E_NORMALISE=0 passes the model's own session_id through instead of
+        # taking it over: the control that proves the declared-id scenario fails
+        # without normalisation (PLAN-510).
+        normaliseDeclarations: ${process.env.E2E_NORMALISE === '0' ? 'false' : 'true'}
     - id: mcp-plumb
       name: '@deepseek-ai/dsh-mcp-client'
       config:
@@ -580,6 +657,9 @@ function readSessionRecords({ root }) {
         externalId,
         purpose,
         isIdentity: /^dsh-[a-z0-9-]{12,}$/.test(externalId ?? ''),
+        // plumb marks a connection carrying more than one logical agent here;
+        // `declared-id` asserts the mark never appears (PLAN-510).
+        health: typeof record.health === 'string' ? record.health : ''
       })
     }
   }
