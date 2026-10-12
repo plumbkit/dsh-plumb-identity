@@ -21,7 +21,7 @@
     "@modelcontextprotocol/sdk": "^1.30.0"
   },
   "scripts": {
-    "test": "node --test test/plugin.test.mjs test/isolated-daemon.test.mjs",
+    "test": "node --test test/plugin.test.mjs test/isolated-daemon.test.mjs test/separate-env.test.mjs test/container/census.test.mjs",
     "test:e2e": "node test/e2e-mock-provider.mjs"
   },
   "keywords": [

@@ -25,23 +25,35 @@ import path from 'node:path'
  *
  * Returns `{ stopped, problems }`: the pids that were signalled and exited,
  * and every reason the scenario must not be called clean. An empty `problems`
- * means that `settleMs` after the stop no plumb socket under `plumbHome` may
- * still have a listener, every pidfile there could be read, and none names a
- * live process other than one `ps` identified as something else (a reused
- * pid). A daemon respawned by a lingering serve is therefore reported, though
- * not stopped.
+ * means that, sampled every 250 ms for `observeMs` after the stop, no plumb
+ * socket under `plumbHome` had a listener, every pidfile there could be read,
+ * and none named a live process other than one `ps` identified as something
+ * else (a reused pid). A daemon respawned by a lingering serve, even one that
+ * redials late in the window, is therefore reported, though not stopped. The
+ * caller deletes the scenario's root only when `problems` is empty.
  */
 export async function stopIsolatedDaemon(plumbHome, {
   probeCommand = psCommand,
   // plumb's own shutdown watchdog fires at 10 s; `plumb stop` waits a little longer.
   stopWaitMs = 12_000,
-  settleMs = 2_000,
+  // PLAN-526: watch a full 30 s before the root may be deleted, longer than a
+  // serve's reconnect backoff, so a late respawn is seen rather than orphaned.
+  observeMs = 30_000,
+  // Injectable for tests that pin the default window without waiting it out.
+  clock = { now: Date.now, sleep },
 } = {}) {
   const problems = []
   const stopped = []
-  if (!fs.existsSync(plumbHome)) return { stopped, problems }
+  // A missing HOME means nothing ran there; one that cannot be looked at is a
+  // problem, never "nothing ran".
+  try {
+    fs.statSync(plumbHome)
+  } catch (error) {
+    if (error.code !== 'ENOENT') problems.push(`could not observe ${plumbHome}: ${error.code ?? error.message}`)
+    return { stopped, problems }
+  }
 
-  const listeningBefore = await listeningSockets(plumbHome)
+  const listeningBefore = await listeningSockets(plumbHome, problems)
   const targets = []
   const foreign = []
   for (const { pid, mtimeMs } of readPidfiles(plumbHome, problems)) {
@@ -78,14 +90,24 @@ export async function stopIsolatedDaemon(plumbHome, {
     else stopped.push(pid)
   }
 
-  // Settle, then look again: a serve still running could have respawned a
-  // daemon after the one above exited. That is reported, not stopped.
-  await sleep(settleMs)
-  for (const { path: socket } of await listeningSockets(plumbHome)) {
-    problems.push(`a plumb daemon is still listening on ${socket}`)
-  }
-  for (const { pid } of readPidfiles(plumbHome, problems)) {
-    if (isAlive(pid) && !targets.includes(pid) && !foreign.includes(pid)) problems.push(`a pidfile under ${plumbHome} names live pid ${pid} after teardown`)
+  // Keep looking for observeMs: a serve still running could respawn a daemon
+  // at any point after the one above exited. That is reported, not stopped,
+  // and the first sighting ends the watch, since the scenario has failed.
+  const end = clock.now() + observeMs
+  for (;;) {
+    const seen = []
+    for (const { path: socket } of await listeningSockets(plumbHome, seen)) {
+      seen.push(`a plumb daemon is still listening on ${socket}`)
+    }
+    for (const { pid } of readPidfiles(plumbHome, seen)) {
+      if (isAlive(pid) && !targets.includes(pid) && !foreign.includes(pid)) seen.push(`a pidfile under ${plumbHome} names live pid ${pid} after teardown`)
+    }
+    if (seen.length > 0) {
+      problems.push(...seen)
+      break
+    }
+    if (clock.now() >= end) break
+    await clock.sleep(250)
   }
   return { stopped, problems }
 }
@@ -134,7 +156,7 @@ export function psCommand(pid) {
  */
 function readPidfiles(plumbHome, problems) {
   const out = []
-  for (const dir of walkDirs(plumbHome, 0)) {
+  for (const dir of walkDirs(plumbHome, 0, problems)) {
     const file = path.join(dir, 'plumb.pid')
     let text
     let mtimeMs
@@ -152,15 +174,19 @@ function readPidfiles(plumbHome, problems) {
   return out
 }
 
-/** The plumb.sock files under `plumbHome` that accept a connection, with their mtimes. */
-async function listeningSockets(plumbHome) {
+/**
+ * The plumb.sock files under `plumbHome` that accept a connection, with their
+ * mtimes. A directory or socket that cannot be looked at goes to `problems`.
+ */
+async function listeningSockets(plumbHome, problems) {
   const live = []
-  for (const dir of walkDirs(plumbHome, 0)) {
+  for (const dir of walkDirs(plumbHome, 0, problems)) {
     const socket = path.join(dir, 'plumb.sock')
     let mtimeMs
     try {
       mtimeMs = fs.lstatSync(socket).mtimeMs
-    } catch {
+    } catch (error) {
+      if (!GONE.includes(error.code)) problems.push(`could not observe ${socket}: ${error.code ?? error.message}`)
       continue
     }
     if (await accepts(socket)) live.push({ path: socket, mtimeMs })
@@ -197,17 +223,31 @@ export function isAlive(pid) {
   }
 }
 
-export function walkDirs(dir, depth) {
-  if (depth > 8) return []
+// Errors that mean the path is simply not there (any more): a daemon exiting
+// removes its files, so these are not a failure to observe.
+const GONE = ['ENOENT', 'ENOTDIR']
+
+/**
+ * `dir` and every directory under it, at most 8 levels deep. With `problems`,
+ * teardown's observers pass the reason any directory could not be listed (or
+ * the depth ran out), so a hidden runtime dir reads as unobserved, not clean.
+ * Without it, the e2e's readers just skip what they cannot list.
+ */
+export function walkDirs(dir, depth, problems = null) {
+  if (depth > 8) {
+    problems?.push(`not observed: ${dir} is deeper than the 8 levels teardown walks`)
+    return []
+  }
   const out = [dir]
   let entries
   try {
     entries = fs.readdirSync(dir, { withFileTypes: true })
-  } catch {
+  } catch (error) {
+    if (!GONE.includes(error.code)) problems?.push(`could not list ${dir}: ${error.code ?? error.message}`)
     return out
   }
   for (const entry of entries) {
-    if (entry.isDirectory()) out.push(...walkDirs(path.join(dir, entry.name), depth + 1))
+    if (entry.isDirectory()) out.push(...walkDirs(path.join(dir, entry.name), depth + 1, problems))
   }
   return out
 }

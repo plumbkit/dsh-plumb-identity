@@ -16,7 +16,7 @@ const FAKE_DAEMON = fileURLToPath(new URL('./fixtures/fake-daemon.mjs', import.m
 const PS_DENIED = () => null
 const PS_PLUMB = () => '/usr/local/bin/plumb daemon'
 const PS_FOREIGN = () => '/usr/bin/some-other-process'
-const FAST = { stopWaitMs: 2_000, settleMs: 500 }
+const FAST = { stopWaitMs: 2_000, observeMs: 500 }
 
 /** A scratch plumbhome (shallow, for the Unix socket path limit) and its runtime dir. */
 function scratchHome(t) {
@@ -96,7 +96,7 @@ test('a listening socket with no pidfile fails closed instead of reading as "not
   assert.ok(problems.some((p) => p.includes(`still listening on ${path.join(runtimeDir, 'plumb.sock')}`)), problems.join('\n'))
 })
 
-test('a daemon respawned after the stop is caught by the settle check', async (t) => {
+test('a daemon respawned after the stop is caught by the watch', async (t) => {
   const home = scratchHome(t)
   const { plumbHome, runtimeDir } = home
   const pid = await startFake(home, 'respawn')
@@ -104,6 +104,58 @@ test('a daemon respawned after the stop is caught by the settle check', async (t
   assert.deepEqual(stopped, [pid])
   assert.ok(problems.some((p) => p.includes('still listening')), problems.join('\n'))
   assert.ok(problems.some((p) => p.includes('names live pid')), problems.join('\n'))
+})
+
+test('a daemon respawned late in the watch is still caught (PLAN-526)', async (t) => {
+  const home = scratchHome(t)
+  const pid = await startFake(home, 'late-respawn')
+  const started = Date.now()
+  const { stopped, problems } = await stopIsolatedDaemon(home.plumbHome, { ...FAST, observeMs: 4_000, probeCommand: PS_PLUMB })
+  assert.deepEqual(stopped, [pid])
+  assert.ok(problems.some((p) => p.includes('still listening')), problems.join('\n'))
+  // The replacement binds 1.5 s after the stop: a single check at the old 500 ms settle would have missed it.
+  assert.ok(Date.now() - started >= 1_400, 'the watch saw it only after the replacement bound')
+})
+
+test('a clean stop is watched for the whole window before it counts as clean', async (t) => {
+  const home = scratchHome(t)
+  await startFake(home, 'graceful')
+  const started = Date.now()
+  const { problems } = await stopIsolatedDaemon(home.plumbHome, { ...FAST, observeMs: 1_500, probeCommand: PS_PLUMB })
+  assert.deepEqual(problems, [])
+  assert.ok(Date.now() - started >= 1_500, `returned after ${Date.now() - started} ms, before the 1500 ms watch ended`)
+})
+
+test('a directory under HOME that cannot be listed is a problem, not a clean HOME (PLAN-526)', { skip: process.getuid?.() === 0 && 'root lists any directory' }, async (t) => {
+  const home = scratchHome(t)
+  const hidden = path.join(home.plumbHome, 'Library')
+  fs.mkdirSync(hidden, { recursive: true })
+  fs.chmodSync(hidden, 0o000) // readdir now fails with EACCES
+  let result
+  try {
+    result = await stopIsolatedDaemon(home.plumbHome, { ...FAST, probeCommand: PS_DENIED })
+  } finally {
+    fs.chmodSync(hidden, 0o700) // before scratchHome's cleanup removes the tree
+  }
+  const { stopped, problems } = result
+  assert.deepEqual(stopped, [])
+  assert.ok(problems.some((p) => p.includes(`could not list ${hidden}`)), problems.join('\n'))
+})
+
+test('a HOME that cannot be looked at is a problem; a missing one is clean', { skip: process.getuid?.() === 0 && 'root stats any path' }, async (t) => {
+  const home = scratchHome(t)
+  const parent = path.dirname(home.plumbHome)
+  fs.mkdirSync(home.plumbHome, { recursive: true })
+  fs.chmodSync(parent, 0o000) // stat of plumbhome now fails with EACCES
+  let denied
+  try {
+    denied = await stopIsolatedDaemon(home.plumbHome, { ...FAST, probeCommand: PS_DENIED })
+  } finally {
+    fs.chmodSync(parent, 0o700)
+  }
+  assert.ok(denied.problems.some((p) => p.includes(`could not observe ${home.plumbHome}`)), denied.problems.join('\n'))
+  const missing = await stopIsolatedDaemon(path.join(parent, 'never-created'), { ...FAST, probeCommand: PS_DENIED })
+  assert.deepEqual(missing, { stopped: [], problems: [] })
 })
 
 test('a socket file with no listener (a daemon that died without cleaning up) reads as stopped', async (t) => {
@@ -161,6 +213,17 @@ test('ps naming another process: a stale pidfile is left alone and is not a prob
   assert.deepEqual(stopped, [])
   assert.deepEqual(problems, [])
   assert.equal(isAlive(pid), true, 'a process ps names as foreign must not be signalled')
+})
+
+test('by default a stop is watched for 30 s before it counts as clean (PLAN-526)', async (t) => {
+  const home = scratchHome(t)
+  fs.mkdirSync(home.runtimeDir, { recursive: true }) // a HOME with nothing running in it
+  let now = 0
+  const clock = { now: () => now, sleep: async (ms) => { now += ms } }
+  const { problems } = await stopIsolatedDaemon(home.plumbHome, { probeCommand: PS_DENIED, clock })
+  assert.deepEqual(problems, [])
+  assert.ok(now >= 30_000, `watched ${now} ms of fake time, want the 30 000 ms default`)
+  assert.ok(now < 30_500, `watched ${now} ms, more than the default plus one step`)
 })
 
 test('no plumbhome at all: nothing to stop and nothing wrong', async () => {

@@ -22,6 +22,12 @@
 //   npm run test:e2e                       every scenario
 //   node test/e2e-mock-provider.mjs --mode tool-call [--mode subagent]
 //   --keep / E2E_KEEP=1                    keep temp roots for debugging
+//   --list                                 print the scenario names and exit
+//
+// Where: never on a developer machine. Each scenario starts a plumb daemon of
+// its own, so the suite refuses to start (exit 2) unless separate-env.mjs finds
+// a CI runner, a container or a declared VM. test/e2e-container.sh runs it in
+// Docker and checks that no daemon outlives it.
 //
 // Requirements: a dsh install (DSH_BIN, else the $DSH_HOME / ~/.dsh profile
 // tree, exactly what dsh itself resolves) and a plumb binary (PLUMB_BIN, else
@@ -34,6 +40,14 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createFakeModel, TYPED_SESSION_ID } from './fake-model.mjs'
 import { endProcessGroup, stopIsolatedDaemon, walkDirs } from './isolated-daemon.mjs'
+import { refusal, separateEnvironment } from './separate-env.mjs'
+
+// Every scenario starts a plumb daemon of its own, so refuse on a developer host
+// before resolving anything, creating a root or installing a signal handler.
+if (separateEnvironment() === null) {
+  console.error(refusal('e2e'))
+  process.exit(2)
+}
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const PLUGIN_FILE = path.join(REPO_ROOT, 'dsh-plumb-identity.mjs')
@@ -302,6 +316,12 @@ main().catch((error) => {
 
 async function main() {
   const args = process.argv.slice(2)
+  // The scenario names, one per line: test/container/run.sh checks the run
+  // passed every one of them, so a scenario that never ran cannot pass.
+  if (args.includes('--list')) {
+    console.log(Object.keys(SCENARIOS).join('\n'))
+    process.exit(0)
+  }
   const keep = args.includes('--keep') || process.env.E2E_KEEP === '1'
   const wanted = args.includes('--mode') ? args.flatMap((a, i) => (a === '--mode' ? [args[i + 1]] : [])) : Object.keys(SCENARIOS)
   for (const mode of wanted) {
@@ -388,7 +408,13 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
     if (run.timedOut) console.error(`  dsh timed out after ${RUN_TIMEOUT_MS}ms`)
     console.log(`  dsh exit=${run.code}${run.timedOut ? ' (timed out)' : ''}`)
 
-    const problem = await scenario.expect({ root, fake, setup, gate })
+    // A run cut off by the timeout, or one that failed, is not a pass, whatever
+    // records it left first. Teardown still runs in the finally below.
+    const problem = run.timedOut
+      ? `dsh did not finish within ${RUN_TIMEOUT_MS}ms`
+      : run.code !== 0
+        ? `dsh exited ${run.code}`
+        : await scenario.expect({ root, fake, setup, gate })
     if (problem === null) {
       console.log(`  PASS ${mode}`)
       passed = true
@@ -549,7 +575,31 @@ llm-pi-ai:
     dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } },
   }, null, 2)}\n`)
 
+  // DSH 0.2 no longer reads settings.yaml at boot: it imports the file into the
+  // profile only after the loader settles, so a fresh headless run starts on the
+  // built-in default (deepseek-official) and fails MISSING_CREDENTIAL. The same
+  // two sections as id-targeted rows of the home patch layer take effect at boot
+  // on 0.2; settings.yaml above stays for 0.1.
   fs.writeFileSync(path.join(home, 'cordis.patch.yml'), `\
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: dsh-identity-fake
+    model: fake-1
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      dsh-identity-fake:
+        displayName: dsh-plumb-identity e2e fake
+        apiKeyEnv: FAKE_MODEL_KEY
+        api: openai-completions
+        baseURL: ${fakeUrl}
+        models:
+          - id: fake-1
+            name: Fake One
+            contextWindow: 131072
+            maxTokens: 8192
 # Mounts the plugin from THIS checkout (the code under test) above the isolated
 # plumb mcp-client row. Order is irrelevant to correctness — the plugin
 # captures the plumb client during the SDK's tools sync — but matches the
