@@ -471,11 +471,17 @@ async function runScenario({ mode, task, harness, plumbBin, isolation, keep }) {
 
     // A run cut off by the timeout, or one that failed, is not a pass, whatever
     // records it left first. Teardown still runs in the finally below.
-    const problem = run.timedOut
+    const ran = !run.timedOut && run.code === 0
+    const failure = run.timedOut
       ? `dsh did not finish within ${RUN_TIMEOUT_MS}ms`
       : run.code !== 0
         ? `dsh exited ${run.code}`
-        : environment.beforeExpect() ?? (await scenario.expect({ source, fake, setup, gate })) ?? environment.afterExpect()
+        : environment.beforeExpect() ?? (await scenario.expect({ source, fake, setup, gate }))
+    // Checked whether or not the scenario's own assertions held: a serve that
+    // never joined the namespace is the likeliest reason they did not, and the
+    // leak is what explains it.
+    const leak = ran ? environment.afterExpect() : null
+    const problem = leak === null ? failure : failure === null ? leak : `${failure}; ${leak}`
     if (problem === null) {
       console.log(`  PASS ${mode}`)
       passed = true
