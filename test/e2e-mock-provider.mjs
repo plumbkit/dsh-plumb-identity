@@ -62,8 +62,9 @@ import { refusal, separateEnvironment } from './separate-env.mjs'
 import { readRecordsUnder } from './session-records.mjs'
 import { installSignalTeardown } from './signal-teardown.mjs'
 
-// Every scenario starts a plumb daemon of its own, so refuse on a developer host
-// before resolving anything, creating a root or installing a signal handler.
+// Either isolation drives a plumb daemon (a developer host's one daemon is not a
+// test's), so refuse on a developer host before resolving anything, creating a
+// root, creating a namespace or installing a signal handler.
 if (separateEnvironment() === null) {
   console.error(refusal('e2e'))
   process.exit(2)
