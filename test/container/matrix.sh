@@ -28,7 +28,10 @@
 #        "namespace isolation is unavailable" message), never fall back to a
 #        daemon per scenario, and the census must still show the one daemon
 #
-#   test/container/matrix.sh --plumb <linux plumb binary> [--plumb-old <linux plumb without namespaces>] [--out <dir>]
+#   test/container/matrix.sh --plumb <linux plumb binary> [--plumb-old <linux plumb without namespaces>] [--out <dir>] [--only <n,n,...>]
+#
+# --only runs just those rows (to re-run a row that failed for a reason outside the
+# e2e; the rows that were not asked for are neither run nor counted).
 #
 # Each run's log and a summary go to --out (default: a new temp dir). The host's
 # own plumb daemon count is recorded before and after each run and must not move.
@@ -39,8 +42,9 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 plumb=
 plumb_old=
 out=
+only=
 usage() {
-  echo "usage: test/container/matrix.sh --plumb <linux plumb binary> [--plumb-old <linux plumb without namespaces>] [--out <dir>]" >&2
+  echo "usage: test/container/matrix.sh --plumb <linux plumb binary> [--plumb-old <linux plumb without namespaces>] [--out <dir>] [--only <n,n,...>]" >&2
   exit 64
 }
 while [ $# -gt 0 ]; do
@@ -48,10 +52,12 @@ while [ $# -gt 0 ]; do
     --plumb) [ $# -ge 2 ] || usage; plumb=$2; shift 2 ;;
     --plumb-old) [ $# -ge 2 ] || usage; plumb_old=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || usage; out=$2; shift 2 ;;
+    --only) [ $# -ge 2 ] || usage; only=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 [ -n "$plumb" ] || usage
+[ -z "$only" ] || [[ "$only" =~ ^[0-9]+(,[0-9]+)*$ ]] || usage
 out=${out:-$(mktemp -d "${TMPDIR:-/tmp}/e2e-matrix.XXXXXX")}
 mkdir -p "$out"
 
@@ -59,15 +65,25 @@ mkdir -p "$out"
 # `daemon`), as census.mjs counts them in the container; "?" when ps cannot
 # answer, or answers without listing this shell itself (an empty listing is
 # not "no daemon"), which fails the run.
+# ps is asked up to five times: on a machine busy enough, one call can fail or
+# come back without this shell in it, and a row's verdict should not turn on that.
+# Still fail-closed: five bad answers in a row are "?".
 host_daemons() {
-  local list
-  list=$(ps -axo pid=,command=) || { echo '?'; return; }
-  printf '%s\n' "$list" | grep -Eq "^ *$$ " || { echo '?'; return; }
-  list=$(printf '%s\n' "$list" | sed -E 's/^ *[0-9]+ //')
-  printf '%s\n' "$list" | grep -Ec '^([^ ]*/)?plumb daemon( |$)'
+  local list attempt
+  for attempt in 1 2 3 4 5; do
+    if list=$(ps -axo pid=,command= 2> /dev/null) && printf '%s\n' "$list" | grep -Eq "^ *$$ "; then
+      list=$(printf '%s\n' "$list" | sed -E 's/^ *[0-9]+ //')
+      printf '%s\n' "$list" | grep -Ec '^([^ ]*/)?plumb daemon( |$)'
+      return
+    fi
+    sleep 1
+  done
+  echo '?'
 }
 
 failed=0
+ran=0
+not_run=
 summary="$out/summary.txt"
 : > "$summary"
 
@@ -75,6 +91,10 @@ summary="$out/summary.txt"
 # PLUMB_FOR_RUN=<binary> run ...  runs it against that plumb instead of --plumb.
 run() {
   local n=$1 label=$2 bin=${PLUMB_FOR_RUN:-$plumb}
+  if [ -n "$only" ] && [[ ",$only," != *",$n,"* ]]; then
+    return 0
+  fi
+  ran=$((ran + 1))
   shift 2
   local envs=()
   while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
@@ -107,14 +127,14 @@ run 10 "runner SIGKILL" E2E_SIGNAL_RUNNER=KILL E2E_SIGNAL_AFTER_MS=20000 --
 run 11 "daemon isolation, suite" E2E_ISOLATION=daemon E2E_EXPECT=pass --
 run 12 "daemon isolation, SIGTERM" E2E_ISOLATION=daemon E2E_SIGNAL_RUNNER=TERM E2E_SIGNAL_AFTER_MS=20000 --
 run 13 "daemon isolation, SIGKILL" E2E_ISOLATION=daemon E2E_SIGNAL_RUNNER=KILL E2E_SIGNAL_AFTER_MS=20000 --
-total=13
 if [ -n "$plumb_old" ]; then
   PLUMB_FOR_RUN=$plumb_old run 14 "refusal: plumb w/o namespaces" E2E_EXPECT=fail \
     "E2E_EXPECT_FAIL_MATCH=^e2e: namespace isolation is unavailable: " -- --mode per-agent
-  total=14
-else
+elif [ -z "$only" ] || [[ ",$only," == *",14,"* ]]; then
+  # Said, not skipped quietly, and not counted as a pass: the summary line carries it.
   echo "14  refusal: plumb w/o namespaces  NOT RUN (pass --plumb-old <linux plumb without namespaces>)" | tee -a "$summary"
+  not_run=" (row 14 NOT RUN: no --plumb-old)"
 fi
 
-echo "matrix: $((total - failed))/$total passed; logs in $out" | tee -a "$summary"
-[ "$failed" -eq 0 ]
+echo "matrix: $((ran - failed))/$ran passed$not_run; logs in $out" | tee -a "$summary"
+[ "$ran" -gt 0 ] && [ "$failed" -eq 0 ]
