@@ -75,9 +75,19 @@ export function parseJsonOutput(stdout) {
   }
 }
 
+/**
+ * The first line of a command's output that says something. plumb prints its logo
+ * (colour escapes and box-drawing characters) before a failing command's error,
+ * and the error itself as `✗ error` over `┊ <message>` lines, so the first
+ * non-empty line is the banner: skip the banner, the header and the gutter.
+ */
 function firstLine(text) {
-  const line = String(text).split('\n').map((part) => part.trim()).find((part) => part.length > 0)
-  return line === undefined ? '' : line.slice(0, 300)
+  const lines = String(text)
+    .replace(/\u001b\[[0-9;]*m/g, '')
+    .split('\n')
+    .map((part) => part.trim().replace(/^┊\s*/, '').trim())
+    .filter((part) => part.length > 0 && !/^[╭╮╯╰─│┃┣┓┛┏┳┻┫┗┌┐└┘├┤┬┴┼━╷╵╴╶\s]+$/u.test(part) && !/^✗\s*error$/u.test(part))
+  return lines.length === 0 ? '' : lines[0].slice(0, 300)
 }
 
 function describeRun({ status, signal, stderr, stdout, error }) {

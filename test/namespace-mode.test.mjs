@@ -85,6 +85,47 @@ test('classifyBinaryProbe: a build without `plumb namespace` is not capable', ()
   assert.match(probe.detail, /unknown command "namespace"/)
 })
 
+// What plumb 0.25 prints for a command it does not have: its logo in colour, then the error.
+const OLD_PLUMB_STDERR = [
+  '\u001b[38;2;224;138;85m╭─╮ ╷        ╷\u001b[m  ',
+  '\u001b[38;2;224;138;85m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m',
+  '\u001b[38;2;224;138;85m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m',
+  '\u001b[38;2;224;138;85m────╮ ╰╯ ╭──────\u001b[m',
+  '',
+  ' \u001b[1;30;48;2;217;105;74m ✗ \u001b[m \u001b[1;38;2;217;105;74merror\u001b[m',
+  '    \u001b[38;2;46;47;39m┊\u001b[m \u001b[38;2;170;165;149munknown command "namespace" for "plumb"\u001b[m',
+  '    \u001b[38;2;46;47;39m┊\u001b[m',
+  '    \u001b[38;2;46;47;39m┊\u001b[m Try:',
+].join('\n')
+
+test('classifyBinaryProbe: the refusal names plumb\'s error, not its logo', () => {
+  const probe = classifyBinaryProbe(failed(OLD_PLUMB_STDERR))
+  assert.equal(probe.ok, false)
+  assert.equal(probe.detail, 'exit 1: unknown command "namespace" for "plumb"')
+  const message = describeProbeFailure(probe)
+  assert.match(message, /^namespace isolation is unavailable: exit 1: unknown command "namespace" for "plumb"\n/)
+  assert.doesNotMatch(message, /[╭╷┣]/u, 'no banner')
+})
+
+test('classifyDaemonProbe: no daemon is reported by plumb\'s message, not its logo', () => {
+  const stderr = [
+    '\u001b[38;2;224;138;85m╭─╮ ╷        ╷\u001b[m',
+    ' ✗  error',
+    '    ┊ daemon control socket unavailable — is plumb daemon running?',
+    '    ┊  start it with: plumb serve',
+  ].join('\n')
+  const probe = classifyDaemonProbe(failed(stderr))
+  assert.equal(probe.kind, 'daemon-unreachable')
+  assert.equal(probe.detail, 'exit 1: daemon control socket unavailable — is plumb daemon running?')
+})
+
+test('classifyDaemonProbe: an older daemon\'s message is found behind the banner too', () => {
+  const stderr = '\u001b[1m╭─╮\u001b[m\n ✗  error\n    ┊ the daemon does not support namespaces (reply "unknown"); update and restart it\n'
+  const probe = classifyDaemonProbe(failed(stderr))
+  assert.equal(probe.kind, 'daemon-old')
+  assert.equal(probe.detail, 'the daemon does not support namespaces (reply "unknown"); update and restart it')
+})
+
 test('classifyBinaryProbe: exit 0 is not enough: the four commands must be listed', () => {
   for (const missing of ['create', 'renew', 'release', 'list']) {
     const help = HELP.replace(new RegExp(`\\b${missing}\\b`, 'g'), 'x')
