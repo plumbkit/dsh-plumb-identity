@@ -13,10 +13,18 @@
 //     resolve (the plugin's default sdkPath rides the same symlink);
 //   - the plugin mounted via a `file://` patch row, so the working tree — the
 //     code under test — is exactly what runs;
-//   - an isolated `plumb serve`: its HOME and XDG roots are redirected under
-//     the temp root, and session-manager (TSM_ORIG_*) companions are stripped
-//     so plumb's hijack recovery cannot relocate the sandbox back at the real
-//     user state. Assertions read plumb's own session records, never the mock.
+//   - the scenario's plumb, isolated one of two ways (E2E_ISOLATION, see
+//     namespace-mode.mjs):
+//       namespace (default)  ONE plumb daemon, already running, for the whole
+//                            run; the scenario creates a plumb namespace and
+//                            every `plumb serve` it causes joins it through
+//                            PLUMB_NAMESPACE. It starts and stops no daemon.
+//       daemon               a plumb daemon of the scenario's own: HOME and XDG
+//                            roots are redirected under the temp root, and
+//                            session-manager (TSM_ORIG_*) companions are
+//                            stripped so plumb's hijack recovery cannot
+//                            relocate the sandbox back at the real user state.
+//     Assertions read plumb's own session records, never the mock.
 //
 // Usage:
 //   npm run test:e2e                       every scenario
@@ -24,10 +32,19 @@
 //   --keep / E2E_KEEP=1                    keep temp roots for debugging
 //   --list                                 print the scenario names and exit
 //
-// Where: never on a developer machine. Each scenario starts a plumb daemon of
-// its own, so the suite refuses to start (exit 2) unless separate-env.mjs finds
-// a CI runner, a container or a declared VM. test/e2e-container.sh runs it in
-// Docker and checks that no daemon outlives it.
+// Where: never on a developer machine. The suite refuses to start (exit 2)
+// unless separate-env.mjs finds a CI runner, a container or a declared VM,
+// whichever isolation is chosen: a namespace run still talks to a daemon, and a
+// developer machine's one daemon is not a test's to talk to. test/e2e-container.sh
+// runs it in Docker, starts the one daemon namespace mode needs, and checks that
+// exactly one daemon ran and none outlives it.
+//
+// E2E_ISOLATION=namespace|daemon   default namespace. Namespace mode probes the
+//                                  plumb in use first and REFUSES (exit 2) when it
+//                                  has no namespaces; it never falls back to a
+//                                  daemon per scenario. `daemon` is the old
+//                                  isolation, chosen only by naming it.
+// --isolation                      print the isolation this run would use and exit
 //
 // Requirements: a dsh install (DSH_BIN, else the $DSH_HOME / ~/.dsh profile
 // tree, exactly what dsh itself resolves) and a plumb binary (PLUMB_BIN, else
@@ -40,7 +57,9 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createFakeModel, TYPED_SESSION_ID } from './fake-model.mjs'
 import { endProcessGroup, stopIsolatedDaemon, walkDirs } from './isolated-daemon.mjs'
+import { createNamespaceEnvironment, NamespaceUnavailable, resolveIsolation, selectIsolation } from './namespace-mode.mjs'
 import { refusal, separateEnvironment } from './separate-env.mjs'
+import { readRecordsUnder } from './session-records.mjs'
 
 // Every scenario starts a plumb daemon of its own, so refuse on a developer host
 // before resolving anything, creating a root or installing a signal handler.
@@ -210,20 +229,20 @@ const SCENARIOS = {
  * once through check_messages, and its plumb session id is the same on both
  * sides of the reconnect.
  */
-async function expectNoteSurvivedReconnect({ root, fake, gate }) {
+async function expectNoteSurvivedReconnect({ source, fake, gate }) {
   if (gate.error) return `the reconnect was never staged: ${gate.error}`
   if (!gate.ended) return 'the gate never ran, so no reconnect was staged'
   // The positive control: check_messages went over a SECOND connection. Each
   // connection leaves a record, resumed or not, so one connection is a run in
   // which nothing reconnected and the rest of this proves nothing.
-  const connections = readSessionRecords({ root }).filter((r) => r.clientName === 'dsh-plumb-identity')
+  const connections = readSessionRecords({ source }).filter((r) => r.clientName === 'dsh-plumb-identity')
   if (connections.length < 2) return `expected the agent to reconnect (two own connections), found ${connections.length}`
   const results = fake.toolResults
   if (!results.some((r) => /check_messages$/.test(r.name ?? ''))) {
     return `the model never received a check_messages result (tool results: ${results.map((r) => r.name).join(', ') || 'none'})`
   }
   const hits = results.flatMap((r) => Array(r.content.split(gate.marker).length - 1).fill(r.name))
-  const ids = [...new Set(agentRecords({ root }).map((r) => r.id))]
+  const ids = [...new Set(agentRecords({ source }).map((r) => r.id))]
   if (hits.length === 0) {
     return `the note sent while the agent was connected never reached it after the reconnect: stranded on session ${gate.sessionId} (agent session ids seen: ${ids.join(', ')})`
   }
@@ -242,15 +261,25 @@ async function expectNoteSurvivedReconnect({ root, fake, gate }) {
  * 48 ms after it was issued and every state-changing call on that connection
  * was refused.
  */
-function declaredIdWasTakenOver({ root }) {
-  const records = readSessionRecords({ root })
+function declaredIdWasTakenOver({ source }) {
+  const records = readSessionRecords({ source })
+  // The positive control for every absence check below: the plugin's own
+  // declaration reached plumb and this reader can see it. Without it a reader
+  // pointed at the wrong place finds no typed id and no mark, and "nothing
+  // wrong" is exactly what it would report.
+  if (!records.some((r) => r.isIdentity)) {
+    return 'no session record carries the plugin\'s declared identity, so the checks below have nothing to look at'
+  }
+  // Every check runs and every failure is reported, so a red control names each
+  // symptom it produces rather than only the first the code happens to reach.
+  const problems = []
   const typed = records.filter((r) => r.externalId === TYPED_SESSION_ID)
   if (typed.length > 0) {
-    return `the model's own session_id (${TYPED_SESSION_ID}) became a declared linkage on ${typed.length} record(s) — two logical agents on one connection`
+    problems.push(`the model's own session_id (${TYPED_SESSION_ID}) became a declared linkage on ${typed.length} record(s) — two logical agents on one connection`)
   }
   const marked = records.filter((r) => r.health === 'shared_connection_detected')
   if (marked.length > 0) {
-    return `the typed declaration marked ${marked.length} connection(s) shared_connection_detected, where anonymous state-changing calls are refused: ${marked.map((r) => r.id).join(', ')}`
+    problems.push(`the typed declaration marked ${marked.length} connection(s) shared_connection_detected, where anonymous state-changing calls are refused: ${marked.map((r) => r.id).join(', ')}`)
   }
   // What the DAEMON saw, which is the sharpest form of the same fact: a second
   // logical agent on one connection is exactly what makes it log the shared
@@ -261,37 +290,48 @@ function declaredIdWasTakenOver({ root }) {
   // registers it depends on its roster/owner rules, which a scripted model does
   // not reach. Matched on the message, not the agent id: the line prints the id
   // through plumb's abbreviating label, so the full id is not in it.
-  const daemonLog = readDaemonLog(root)
-  if (daemonLog.includes('shared connection detected')) {
-    return 'the daemon reported a shared connection: the model\'s typed declaration registered a second logical agent on it'
+  const daemonLog = source.daemonLog()
+  // The positive control for that check: the scenario's connections left lines in
+  // the log this reads (a daemon logs one when each connects). In a shared
+  // daemon's log the scenario's lines are picked out by its session ids, so a log
+  // read from the wrong place, or lines no longer tagged with them, would
+  // otherwise report "no shared connection" about nothing.
+  if (daemonLog.trim() === '') {
+    problems.push('the daemon log holds no line for this scenario\'s sessions, so its shared-connection check has nothing to look at')
+  } else if (daemonLog.includes('shared connection detected')) {
+    problems.push('the daemon reported a shared connection: the model\'s typed declaration registered a second logical agent on it')
   }
-  return null
+  return problems.length === 0 ? null : problems.join('; ')
 }
 
 /** The isolated daemon's own log, or '' before it has written one. */
-function readDaemonLog(root) {
-  for (const dir of walkDirs(path.join(root, 'plumbhome'), 0)) {
+function readDaemonLogUnder(plumbHome) {
+  for (const dir of walkDirs(plumbHome, 0)) {
     const file = path.join(dir, 'daemon.log')
     if (fs.existsSync(file)) return fs.readFileSync(file, 'utf8')
   }
   return ''
 }
 
-// Scenario roots whose daemon has not been torn down yet, and the process groups
-// of dsh runs not yet ended. A runner stopped by a signal (a tool timeout, ^C)
-// never reaches runScenario's finally, so end and stop these before exiting.
-const liveRoots = new Set()
+// The scenarios' environments not yet torn down (a daemon to stop, or a namespace
+// to release), and the process groups of dsh runs not yet ended. A runner stopped
+// by a signal (a tool timeout, ^C) never reaches runScenario's finally, so end and
+// tear down these before exiting. A SIGKILL cannot be handled: in daemon mode the
+// container's exit ends the daemon, and in namespace mode `--owner-pid` makes the
+// namespace expire once the runner is gone.
+const liveEnvironments = new Map() // root -> environment
 const liveGroups = new Set()
 // Set by the handler: main starts no further scenario and leaves the exit to it.
 let shuttingDown = false
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.once(signal, () => {
     shuttingDown = true
-    console.error(`\ne2e: ${signal}: stopping the plumb daemon of ${liveRoots.size} unfinished scenario(s)`)
+    console.error(`\ne2e: ${signal}: tearing down ${liveEnvironments.size} unfinished scenario(s)`)
     endDshGroups()
       .then((problems) => problems.forEach((problem) => console.error(`  teardown: ${problem}`)))
-      .then(() => Promise.all([...liveRoots].map(async (root) => {
-        const { problems } = await stopIsolatedDaemon(path.join(root, 'plumbhome'))
+      .then(() => Promise.all([...liveEnvironments].map(async ([root, environment]) => {
+        const { notes, problems } = await environment.teardown()
+        for (const note of notes) console.error(`  teardown: ${note}`)
         for (const problem of problems) console.error(`  teardown: ${problem} (kept: ${root})`)
       })))
       .finally(() => process.exit(128 + os.constants.signals[signal]))
@@ -311,7 +351,9 @@ async function endDshGroups() {
 
 main().catch((error) => {
   console.error(`e2e: ${error.message}`)
-  process.exit(1)
+  // A run refused before it began (a plumb without namespaces) is exit 2, like the
+  // host refusal; any other error is a failure.
+  process.exit(error instanceof NamespaceUnavailable ? 2 : 1)
 })
 
 async function main() {
@@ -322,6 +364,12 @@ async function main() {
     console.log(Object.keys(SCENARIOS).join('\n'))
     process.exit(0)
   }
+  // The isolation this run would use, for test/container/run.sh: it starts the
+  // one daemon namespace mode needs, and must agree with this file on whether to.
+  if (args.includes('--isolation')) {
+    console.log(selectIsolation(process.env).mode)
+    process.exit(0)
+  }
   const keep = args.includes('--keep') || process.env.E2E_KEEP === '1'
   const wanted = args.includes('--mode') ? args.flatMap((a, i) => (a === '--mode' ? [args[i + 1]] : [])) : Object.keys(SCENARIOS)
   for (const mode of wanted) {
@@ -330,32 +378,41 @@ async function main() {
 
   const harness = resolveHarness()
   const plumbBin = resolvePlumb()
+  const isolation = resolveIsolation(plumbBin)
   console.log(`e2e: harness ${harness.label}`)
   console.log(`e2e: plumb   ${plumbBin}`)
   console.log(`e2e: plugin  ${PLUGIN_FILE}`)
+  console.log(`e2e: isolation ${isolation.describe}`)
 
   let failures = 0
   for (const mode of wanted) {
     if (shuttingDown) break
-    const passed = await runScenario({ mode, task: SCENARIOS[mode].task, harness, plumbBin, keep })
+    const passed = await runScenario({ mode, task: SCENARIOS[mode].task, harness, plumbBin, isolation, keep })
     if (!passed) failures += 1
   }
   // A signal handler is tearing down and will exit with 128 + its signal.
   if (shuttingDown) return new Promise(() => {})
+  // Every namespace this run created must be revoked by now: one left active
+  // would sit in the shared daemon until its TTL ran out.
+  const left = isolation.ledger?.outstanding() ?? []
+  if (left.length > 0) {
+    console.error(`  FAIL namespaces: ${left.length} namespace(s) were never released: ${left.join(', ')}`)
+    failures += 1
+  }
   console.log(failures === 0 ? `\ne2e: all ${wanted.length} scenario(s) passed` : `\ne2e: ${failures} scenario(s) FAILED`)
   process.exit(failures === 0 ? 0 : 1)
 }
 
 // -- one scenario ----------------------------------------------------------------
 
-async function runScenario({ mode, task, harness, plumbBin, keep }) {
+async function runScenario({ mode, task, harness, plumbBin, isolation, keep }) {
   // Scenario roots must live shallow: the isolated plumb daemon's Unix socket
   // is $HOME-derived, and macOS's default per-user temp dir alone blows past
   // the 104-byte sun_path ceiling (plumb refuses with exactly that hint).
   const parent = fs.existsSync('/tmp') ? '/tmp' : os.tmpdir()
   const root = fs.mkdtempSync(path.join(parent, `dsh-identity-e2e-${mode}-`))
-  liveRoots.add(root)
   let fake
+  let environment = null
   let passed = false
   const scenario = SCENARIOS[mode]
   // What the scenario's gate did, for its expect (see fake-model's `reconnect`).
@@ -372,7 +429,10 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
       beforeCheckMessages: scenario.gate ? () => runGate() : undefined,
       workspace,
     })
-    const plumbSh = writePlumbWrapper({ root, plumbBin })
+    environment = createEnvironment({ isolation, root, plumbBin })
+    liveEnvironments.set(root, environment)
+    const { plumbSh, source } = environment
+    if (environment.namespaceId) console.log(`  namespace ${environment.namespaceId}`)
     const idleMs = scenario.idleMs ?? Number(process.env.E2E_IDLE_MS ?? 60000)
     // A scenario may pin the topology it needs (declared-id-fallback); otherwise
     // E2E_PER_AGENT=0 is the standing control that runs every scenario on the
@@ -382,7 +442,7 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
     fs.mkdirSync(workspace, { recursive: true })
     const setup = scenario.setup ? await scenario.setup({ workspace, plumbSh }) : {}
     if (scenario.gate) {
-      runGate = () => scenario.gate({ root, workspace, plumbSh, idleMs, gate }).catch((error) => {
+      runGate = () => scenario.gate({ source, workspace, plumbSh, idleMs, gate }).catch((error) => {
         gate.error = error.message
         throw error
       })
@@ -396,8 +456,9 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
         DSH_HOME: home,
         // The plugin spawns its OWN `plumb serve` per agent, and resolves it as
         // config.plumbCommand -> $PLUMB_BIN -> `plumb` on PATH. Without this the
-        // per-agent connections use the ambient HOME and talk to the
-        // developer's real daemon instead of this scenario's isolated one.
+        // per-agent connections would not carry the scenario's isolation (its
+        // private HOME, or its namespace token) and would join the developer's
+        // real daemon as the default namespace.
         PLUMB_BIN: plumbSh,
         FAKE_MODEL_KEY: 'dsh-plumb-identity-e2e',
         DSH_PERMISSION_MODE: 'danger-full-access',
@@ -414,7 +475,7 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
       ? `dsh did not finish within ${RUN_TIMEOUT_MS}ms`
       : run.code !== 0
         ? `dsh exited ${run.code}`
-        : await scenario.expect({ root, fake, setup, gate })
+        : environment.beforeExpect() ?? (await scenario.expect({ source, fake, setup, gate })) ?? environment.afterExpect()
     if (problem === null) {
       console.log(`  PASS ${mode}`)
       passed = true
@@ -424,29 +485,68 @@ async function runScenario({ mode, task, harness, plumbBin, keep }) {
   } catch (error) {
     console.error(`  FAIL ${mode}: ${error.message}`)
   } finally {
-    // End dsh and any serve it left before stopping the daemon, or that serve
-    // redials and starts a new one. First, so a fake model still holding a
-    // connection open cannot keep the teardown from running.
+    // End dsh and any serve it left before tearing the isolation down, or that
+    // serve redials the daemon (in daemon mode: starts a new one). First, so a
+    // fake model still holding a connection open cannot keep the teardown from
+    // running.
     for (const problem of await endDshGroups()) {
       console.error(`  FAIL ${mode}: teardown: ${problem}`)
       passed = false
     }
     if (fake) await fake.close()
-    // PLAN-507: `plumb serve` daemonizes this scenario's plumb daemon, so
-    // nothing above ends it. Stop it on pass AND fail, before its HOME is
-    // deleted, and fail the scenario (keeping the root) unless teardown can
-    // show no daemon is left; see isolated-daemon.mjs.
-    const { stopped, problems } = await stopIsolatedDaemon(path.join(root, 'plumbhome'))
-    if (stopped.length > 0) console.log(`  teardown: stopped the isolated plumb daemon (pid ${stopped.join(', ')})`)
-    for (const problem of problems) {
-      console.error(`  FAIL ${mode}: teardown: ${problem}`)
-      passed = false
+    // Daemon mode (PLAN-507): `plumb serve` daemonizes this scenario's plumb
+    // daemon, so nothing above ends it. Stop it on pass AND fail, before its
+    // HOME is deleted, and fail the scenario (keeping the root) unless teardown
+    // can show no daemon is left; see isolated-daemon.mjs. Namespace mode: release
+    // the scenario's namespace, which is all it ever held of the daemon.
+    if (environment) {
+      const { notes, problems } = await environment.teardown()
+      for (const note of notes) console.log(`  teardown: ${note}`)
+      for (const problem of problems) {
+        console.error(`  FAIL ${mode}: teardown: ${problem}`)
+        passed = false
+      }
+      liveEnvironments.delete(root)
     }
-    liveRoots.delete(root)
     if (passed && !keep) fs.rmSync(root, { recursive: true, force: true })
     else console.log(`  (kept for debugging: ${root})`)
   }
   return passed
+}
+
+/**
+ * What a scenario's plumb is, in either isolation: the command every plumb
+ * process goes through (`plumbSh`), where the assertions read plumb's records
+ * (`source`), the two sanity checks around `expect`, and the teardown.
+ *
+ * `beforeExpect`/`afterExpect` return a problem or null. `teardown` resolves
+ * `{ notes, problems }`, and is safe to call twice.
+ */
+function createEnvironment({ isolation, root, plumbBin }) {
+  if (isolation.mode === 'daemon') {
+    const plumbHome = path.join(root, 'plumbhome')
+    let tornDown = null
+    return {
+      plumbSh: writePlumbWrapper({ root, plumbBin }),
+      source: {
+        records: () => readRecordsUnder(plumbHome),
+        daemonLog: () => readDaemonLogUnder(plumbHome),
+      },
+      namespaceId: null,
+      beforeExpect: () => null,
+      afterExpect: () => null,
+      teardown: () => {
+        tornDown ??= stopIsolatedDaemon(plumbHome).then(({ stopped, problems }) => ({
+          notes: stopped.length > 0 ? [`stopped the isolated plumb daemon (pid ${stopped.join(', ')})`] : [],
+          problems,
+        }))
+        return tornDown
+      },
+    }
+  }
+
+  // Namespace mode: see createNamespaceEnvironment.
+  return createNamespaceEnvironment({ ledger: isolation.ledger, files: isolation.files, root, plumbBin })
 }
 
 /**
@@ -467,19 +567,19 @@ async function fileWaitingNote({ workspace, plumbSh }) {
  * records the connection's end, which is the idle close. Releasing the gate
  * then makes the model's check_messages open a NEW connection.
  */
-async function noteWhileConnectedThenReconnect({ root, workspace, plumbSh, idleMs, gate }) {
-  const connected = await pollFor(() => agentRecords({ root }).find((r) => !r.ended), DECLARE_TIMEOUT_MS)
+async function noteWhileConnectedThenReconnect({ source, workspace, plumbSh, idleMs, gate }) {
+  const connected = await pollFor(() => agentRecords({ source }).find((r) => !r.ended), DECLARE_TIMEOUT_MS)
   if (!connected) throw new Error('the agent never opened its own plumb connection')
   gate.sessionId = connected.id
   gate.marker = `plan510-connected-note-${process.pid}-${Date.now()}`
   await sendNote({ workspace, plumbSh, to: connected.name, body: gate.marker })
   // The premise: the note went out while the session was live. A send that
   // outlasted the idle close would test a note to an ended session instead.
-  if (agentRecords({ root }).some((r) => r.id === connected.id && r.ended)) {
+  if (agentRecords({ source }).some((r) => r.id === connected.id && r.ended)) {
     throw new Error(`session ${connected.id} had already ended when the note was sent; raise the scenario's idleMs`)
   }
   console.log(`  gate: sent a note to ${connected.name} (session ${connected.id}) while it is connected`)
-  const ended = await pollFor(() => agentRecords({ root }).find((r) => r.id === connected.id && r.ended), idleMs + DECLARE_TIMEOUT_MS)
+  const ended = await pollFor(() => agentRecords({ source }).find((r) => r.id === connected.id && r.ended), idleMs + DECLARE_TIMEOUT_MS)
   if (!ended) throw new Error(`the agent's connection never idle-closed (session ${connected.id} has no end after ${idleMs + DECLARE_TIMEOUT_MS} ms)`)
   gate.ended = true
   console.log(`  gate: plumb recorded the end of session ${connected.id}; releasing the model's check_messages`)
@@ -637,13 +737,14 @@ llm-pi-ai:
 }
 
 /**
- * The plumb side of the scenario must not touch the developer's real daemon
- * state, so the mcp row's command is a wrapper that relocates every writable
- * plumb root under the temp tree. It passes its arguments through: the plugin
- * runs it as `serve` and, for the resume proof, as `hooks run-claude`, whose
- * key must be this scenario's too. TSM_ORIG_* companions are stripped because
- * plumb's session-manager hijack recovery would otherwise see a temp XDG
- * override and "recover" it back at the real user state.
+ * DAEMON ISOLATION ONLY (E2E_ISOLATION=daemon; namespace isolation has its own
+ * wrapper, namespace-mode.mjs). The plumb side of the scenario must not touch
+ * the developer's real daemon state, so the mcp row's command is a wrapper that
+ * relocates every writable plumb root under the temp tree. It passes its
+ * arguments through: the plugin runs it as `serve` and, for the resume proof, as
+ * `hooks run-claude`, whose key must be this scenario's too. TSM_ORIG_*
+ * companions are stripped because plumb's session-manager hijack recovery would
+ * otherwise see a temp XDG override and "recover" it back at the real user state.
  *
  * plumb 0.25 resolves its daemon's directories from the OS account and refuses to
  * launch one without an installed service profile, ignoring every HOME and XDG_*
@@ -683,7 +784,7 @@ exec '${plumbBin}' "$@"
 // -- plumb-side assertions ---------------------------------------------------------
 
 /**
- * Wait until a session record satisfying `predicate` shows up in the isolated
+ * Wait until a session record satisfying `predicate` shows up in the scenario's
  * plumb state — plumb writes the declaration server-side during the run, so
  * after the dsh process exits it is a short bounded wait at most.
  */
@@ -698,69 +799,12 @@ async function pollForDeclared(ctx, predicate) {
 }
 
 /**
- * Read every declared-session record from the isolated plumb state. The
- * sessions directory's exact parent differs by platform/XDG resolution, so it
- * is located by walking the temp plumbhome; record files are JSON whose
- * external_id/purpose fields are matched tolerantly (the minted identity is
- * recognized by the plugin's "dsh-" prefix and a session-style tail).
+ * Every declared-session record the scenario's session source can see: the
+ * isolated daemon's private state, or the shared daemon's records of the
+ * scenario's own namespace (see session-records.mjs and namespace-mode.mjs).
  */
-function readSessionRecords({ root }) {
-  const plumbHome = path.join(root, 'plumbhome')
-  if (!fs.existsSync(plumbHome)) return []
-  const records = []
-  for (const dir of walkDirs(plumbHome, 0)) {
-    if (path.basename(dir) !== 'sessions') continue
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (!entry.isFile()) continue
-      // plumb writes a session record through an atomic temp file in this same
-      // directory (TempPattern ".session-*.json.tmp", internal/session). Its
-      // own readers match *.json; this one used to read every regular file, so
-      // a complete, fsynced temp file caught before its rename parsed as a
-      // duplicate record — which failed `per-agent` intermittently and, worse,
-      // could satisfy the "two own connections" control in
-      // expectNoteSurvivedReconnect with ONE connection. Found by morning-moose's
-      // round-2 review.
-      if (!entry.name.endsWith('.json') || entry.name.startsWith('.')) continue
-      const file = path.join(dir, entry.name)
-      const text = fs.readFileSync(file, 'utf8')
-      let record = null
-      try {
-        record = JSON.parse(text)
-      } catch {
-        // A half-written record is retried by the next poll.
-        continue
-      }
-      const externalId = typeof record.external_id === 'string' ? record.external_id : null
-      const purpose = typeof record.purpose === 'string' ? record.purpose : null
-      // Who opened the connection. The plugin's per-agent clients name
-      // themselves `dsh-plumb-identity`; the shared MCP row is `dsh-mcp-client`.
-      // This is what distinguishes "one connection per agent" from "one shared
-      // connection carrying a stamped identity" — the two designs produce the
-      // same declaration count, only the client differs.
-      const clientName = typeof record.client_name === 'string' ? record.client_name : null
-      if (externalId === null && purpose === null && clientName === null) continue
-      // Minted ids are `dsh-<workspace-slug>-<short>`; main-conversation
-      // shorts carry a `-session-` segment, subagent shorts are a bare uuid
-      // fragment — so match the minted shape, not either convention.
-      // A Go zero time is how plumb writes "not ended" (omitempty does not
-      // omit a struct), so only a real timestamp counts as an end.
-      const ended = typeof record.ended_at === 'string' && !record.ended_at.startsWith('0001-')
-      records.push({
-        file,
-        id: typeof record.id === 'string' ? record.id : null,
-        name: typeof record.name === 'string' ? record.name : null,
-        ended,
-        clientName,
-        externalId,
-        purpose,
-        isIdentity: /^dsh-[a-z0-9-]{12,}$/.test(externalId ?? ''),
-        // plumb marks a connection carrying more than one logical agent here;
-        // `declared-id` asserts the mark never appears (PLAN-510).
-        health: typeof record.health === 'string' ? record.health : ''
-      })
-    }
-  }
-  return records
+function readSessionRecords(ctx) {
+  return ctx.source.records()
 }
 
 /**

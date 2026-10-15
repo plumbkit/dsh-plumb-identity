@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Run the e2e in a Docker container (PLAN-526). The e2e starts a plumb daemon
-# per scenario, so it refuses to run on a developer machine; this is where it
-# runs instead.
+# Run the e2e in a Docker container (PLAN-526). The e2e drives a plumb daemon (in
+# the default isolation the one daemon test/container/run.sh starts, with a plumb
+# namespace per scenario; with E2E_ISOLATION=daemon, a daemon per scenario), and a
+# developer machine's one daemon is not a test's, so it refuses to run there; this
+# is where it runs instead.
 #
 #   test/e2e-container.sh --plumb <linux plumb binary> [e2e args...]
 #
