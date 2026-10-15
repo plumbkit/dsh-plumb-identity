@@ -1,16 +1,34 @@
 #!/usr/bin/env bash
-# The e2e's off-host acceptance matrix (PLAN-526): ten container runs that must
-# each hold the daemon rules of test/container/run.sh, at most one plumb daemon
-# at a time and none afterwards, on every way a run can end:
+# The e2e's off-host acceptance matrix (PLAN-526, PLAN-520): container runs that
+# must each hold the daemon rules of test/container/run.sh, at most one plumb
+# daemon at a time and none afterwards, on every way a run can end.
+#
+# Rows 1-10 run in the default isolation, NAMESPACE (one daemon, started once by
+# run.sh, a plumb namespace per scenario; the census must show exactly one daemon
+# pid for the whole run and no namespace left active):
 #
 #   1-6  the full suite, every scenario passing
 #   7    a red control (E2E_PER_AGENT=0): the scenario fails, teardown still runs
 #   8    a dsh run timeout: the scenario fails, teardown still runs
-#   9    SIGTERM to the runner mid-run: its signal handler tears down
-#   10   SIGKILL to the runner mid-run: nothing in-process can tear down, so the
-#        container's exit has to end its dsh, serve and daemon
+#   9    SIGTERM to the runner mid-run: its signal handler releases the namespace
+#   10   SIGKILL to the runner mid-run: nothing in-process can release; the
+#        namespace stays active, owned by the dead runner's pid (`--owner-pid`
+#        expires it), and the container's exit ends the daemon, dsh and serves
 #
-#   test/container/matrix.sh --plumb <linux plumb binary> [--out <dir>]
+# Rows 11-13 are the same, in the older isolation (E2E_ISOLATION=daemon, a daemon
+# per scenario under a private HOME), so the older path does not rot:
+#
+#   11   the full suite
+#   12   SIGTERM to the runner mid-run: its handler stops the scenario's daemon
+#   13   SIGKILL to the runner mid-run: the container's exit has to end its daemon
+#
+# Row 14 runs only with --plumb-old, a linux plumb WITHOUT namespaces:
+#
+#   14   the refusal control: the default isolation must REFUSE it (exit 2, the
+#        "namespace isolation is unavailable" message), never fall back to a
+#        daemon per scenario, and the census must still show the one daemon
+#
+#   test/container/matrix.sh --plumb <linux plumb binary> [--plumb-old <linux plumb without namespaces>] [--out <dir>]
 #
 # Each run's log and a summary go to --out (default: a new temp dir). The host's
 # own plumb daemon count is recorded before and after each run and must not move.
@@ -19,14 +37,16 @@ set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 plumb=
+plumb_old=
 out=
 usage() {
-  echo "usage: test/container/matrix.sh --plumb <linux plumb binary> [--out <dir>]" >&2
+  echo "usage: test/container/matrix.sh --plumb <linux plumb binary> [--plumb-old <linux plumb without namespaces>] [--out <dir>]" >&2
   exit 64
 }
 while [ $# -gt 0 ]; do
   case "$1" in
     --plumb) [ $# -ge 2 ] || usage; plumb=$2; shift 2 ;;
+    --plumb-old) [ $# -ge 2 ] || usage; plumb_old=$2; shift 2 ;;
     --out) [ $# -ge 2 ] || usage; out=$2; shift 2 ;;
     *) usage ;;
   esac
@@ -52,8 +72,9 @@ summary="$out/summary.txt"
 : > "$summary"
 
 # run <n> <label> <env assignments...> -- <e2e args...>
+# PLUMB_FOR_RUN=<binary> run ...  runs it against that plumb instead of --plumb.
 run() {
-  local n=$1 label=$2
+  local n=$1 label=$2 bin=${PLUMB_FOR_RUN:-$plumb}
   shift 2
   local envs=()
   while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
@@ -61,7 +82,7 @@ run() {
   local log="$out/run-$n.log" before after verdict gone
   before=$(host_daemons)
   local started=$SECONDS
-  env ${envs[@]+"${envs[@]}"} "$here/../e2e-container.sh" --plumb "$plumb" "$@" > "$log" 2>&1
+  env ${envs[@]+"${envs[@]}"} "$here/../e2e-container.sh" --plumb "$bin" "$@" > "$log" 2>&1
   local rc=$?
   after=$(host_daemons)
   verdict=$(grep -o 'verdict=[A-Z]*' "$log" | tail -1)
@@ -83,6 +104,17 @@ run 8 "dsh run timeout" E2E_EXPECT=fail E2E_RUN_TIMEOUT_MS=6000 \
   "E2E_EXPECT_FAIL_MATCH=^  FAIL per-agent: dsh did not finish within 6000ms" -- --mode per-agent
 run 9 "runner SIGTERM" E2E_SIGNAL_RUNNER=TERM E2E_SIGNAL_AFTER_MS=20000 --
 run 10 "runner SIGKILL" E2E_SIGNAL_RUNNER=KILL E2E_SIGNAL_AFTER_MS=20000 --
+run 11 "daemon isolation, suite" E2E_ISOLATION=daemon E2E_EXPECT=pass --
+run 12 "daemon isolation, SIGTERM" E2E_ISOLATION=daemon E2E_SIGNAL_RUNNER=TERM E2E_SIGNAL_AFTER_MS=20000 --
+run 13 "daemon isolation, SIGKILL" E2E_ISOLATION=daemon E2E_SIGNAL_RUNNER=KILL E2E_SIGNAL_AFTER_MS=20000 --
+total=13
+if [ -n "$plumb_old" ]; then
+  PLUMB_FOR_RUN=$plumb_old run 14 "refusal: plumb w/o namespaces" E2E_EXPECT=fail \
+    "E2E_EXPECT_FAIL_MATCH=^e2e: namespace isolation is unavailable: " -- --mode per-agent
+  total=14
+else
+  echo "14  refusal: plumb w/o namespaces  NOT RUN (pass --plumb-old <linux plumb without namespaces>)" | tee -a "$summary"
+fi
 
-echo "matrix: $((10 - failed))/10 passed; logs in $out" | tee -a "$summary"
+echo "matrix: $((total - failed))/$total passed; logs in $out" | tee -a "$summary"
 [ "$failed" -eq 0 ]
