@@ -98,6 +98,19 @@ test('readRecordsIn: a directory it cannot read is an error, not "no records"', 
   assert.throws(() => readRecordsIn(dir), /cannot read the session directory/)
 })
 
+test('readRecordsIn: a record it cannot read is an error, not a record that is not there', (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip('root reads everything')
+    return
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'records-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const file = path.join(dir, 'a.json')
+  fs.writeFileSync(file, sessionFile({ id: 'a', client_name: 'dsh-mcp-client' }))
+  fs.chmodSync(file, 0o000)
+  assert.throws(() => readRecordsIn(dir), /cannot read the session record/)
+})
+
 test('inNamespace keeps exactly the namespace\'s records', () => {
   const records = [
     parseSessionRecord(sessionFile({ id: 'one', client_name: 'x', namespace: 'ns-aaaa1111' })),
