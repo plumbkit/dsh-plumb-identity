@@ -60,6 +60,7 @@ import { endProcessGroup, stopIsolatedDaemon, walkDirs } from './isolated-daemon
 import { createNamespaceEnvironment, NamespaceUnavailable, resolveIsolation, selectIsolation } from './namespace-mode.mjs'
 import { refusal, separateEnvironment } from './separate-env.mjs'
 import { readRecordsUnder } from './session-records.mjs'
+import { installSignalTeardown } from './signal-teardown.mjs'
 
 // Every scenario starts a plumb daemon of its own, so refuse on a developer host
 // before resolving anything, creating a root or installing a signal handler.
@@ -315,28 +316,19 @@ function readDaemonLogUnder(plumbHome) {
 
 // The scenarios' environments not yet torn down (a daemon to stop, or a namespace
 // to release), and the process groups of dsh runs not yet ended. A runner stopped
-// by a signal (a tool timeout, ^C) never reaches runScenario's finally, so end and
-// tear down these before exiting. A SIGKILL cannot be handled: in daemon mode the
-// container's exit ends the daemon, and in namespace mode `--owner-pid` makes the
-// namespace expire once the runner is gone.
+// by a signal (a tool timeout, ^C) never reaches runScenario's finally, so
+// signal-teardown.mjs ends and tears down these before exiting. A SIGKILL cannot
+// be handled: in daemon mode the container's exit ends the daemon, and in
+// namespace mode `--owner-pid` makes the namespace expire once the runner is gone.
 const liveEnvironments = new Map() // root -> environment
 const liveGroups = new Set()
 // Set by the handler: main starts no further scenario and leaves the exit to it.
 let shuttingDown = false
-for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
-  process.once(signal, () => {
-    shuttingDown = true
-    console.error(`\ne2e: ${signal}: tearing down ${liveEnvironments.size} unfinished scenario(s)`)
-    endDshGroups()
-      .then((problems) => problems.forEach((problem) => console.error(`  teardown: ${problem}`)))
-      .then(() => Promise.all([...liveEnvironments].map(async ([root, environment]) => {
-        const { notes, problems } = await environment.teardown()
-        for (const note of notes) console.error(`  teardown: ${note}`)
-        for (const problem of problems) console.error(`  teardown: ${problem} (kept: ${root})`)
-      })))
-      .finally(() => process.exit(128 + os.constants.signals[signal]))
-  })
-}
+installSignalTeardown({
+  environments: liveEnvironments,
+  endGroups: endDshGroups,
+  onSignal: () => { shuttingDown = true },
+})
 
 /** End every dsh process group still recorded, with whatever serves it holds. */
 async function endDshGroups() {
