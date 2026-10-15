@@ -58,6 +58,11 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$plumb" ] || usage
 [ -z "$only" ] || [[ "$only" =~ ^[0-9]+(,[0-9]+)*$ ]] || usage
+if [ -n "$only" ]; then
+  for r in ${only//,/ }; do
+    { [ "$r" -ge 1 ] && [ "$r" -le 14 ]; } || { echo "matrix: --only names row $r; rows are 1-14" >&2; exit 64; }
+  done
+fi
 out=${out:-$(mktemp -d "${TMPDIR:-/tmp}/e2e-matrix.XXXXXX")}
 mkdir -p "$out"
 
@@ -108,7 +113,14 @@ run() {
   verdict=$(grep -o 'verdict=[A-Z]*' "$log" | tail -1)
   gone=$(grep -c 'is gone, so every process it started has ended' "$log")
   local status=PASS
+  # The row ran in the isolation it is labelled for: an ambient E2E_ISOLATION
+  # on the host must not turn a namespace row into a daemon one that passes.
+  local want_iso=namespace got_iso
+  for kv in ${envs[@]+"${envs[@]}"}; do [ "$kv" = E2E_ISOLATION=daemon ] && want_iso=daemon; done
+  got_iso=$(grep -o 'isolation=[a-z]*' "$log" | tail -1)
   [ "$rc" -eq 0 ] && [ "$verdict" = verdict=PASS ] && [ "$gone" -eq 1 ] && [ "$before" != '?' ] && [ "$after" != '?' ] && [ "$before" = "$after" ] || status=FAIL
+  # A refusal row stops before the isolation is reported; every other row must say it.
+  [ "$n" = 14 ] || [ "$got_iso" = "isolation=$want_iso" ] || status=FAIL
   [ "$status" = PASS ] || failed=$((failed + 1))
   local line
   line=$(printf '%-3s %-28s %s exit=%s %s host_daemons=%s->%s %ss | %s' "$n" "$label" "$status" "$rc" "${verdict:-verdict=?}" "$before" "$after" "$((SECONDS - started))" "$(grep '^run: verdict=' "$log" | tail -1)")
@@ -116,14 +128,14 @@ run() {
 }
 
 for n in 1 2 3 4 5 6; do
-  run "$n" "full suite" E2E_EXPECT=pass --
+  run "$n" "full suite" E2E_ISOLATION=namespace E2E_EXPECT=pass --
 done
-run 7 "red control (per-agent off)" E2E_EXPECT=fail E2E_PER_AGENT=0 \
+run 7 "red control (per-agent off)" E2E_ISOLATION=namespace E2E_EXPECT=fail E2E_PER_AGENT=0 \
   "E2E_EXPECT_FAIL_MATCH=^  FAIL per-agent: expected one connection per calling agent" -- --mode per-agent
-run 8 "dsh run timeout" E2E_EXPECT=fail E2E_RUN_TIMEOUT_MS=6000 \
+run 8 "dsh run timeout" E2E_ISOLATION=namespace E2E_EXPECT=fail E2E_RUN_TIMEOUT_MS=6000 \
   "E2E_EXPECT_FAIL_MATCH=^  FAIL per-agent: dsh did not finish within 6000ms" -- --mode per-agent
-run 9 "runner SIGTERM" E2E_SIGNAL_RUNNER=TERM E2E_SIGNAL_AFTER_MS=20000 --
-run 10 "runner SIGKILL" E2E_SIGNAL_RUNNER=KILL E2E_SIGNAL_AFTER_MS=20000 --
+run 9 "runner SIGTERM" E2E_ISOLATION=namespace E2E_SIGNAL_RUNNER=TERM E2E_SIGNAL_AFTER_MS=20000 --
+run 10 "runner SIGKILL" E2E_ISOLATION=namespace E2E_SIGNAL_RUNNER=KILL E2E_SIGNAL_AFTER_MS=20000 --
 run 11 "daemon isolation, suite" E2E_ISOLATION=daemon E2E_EXPECT=pass --
 run 12 "daemon isolation, SIGTERM" E2E_ISOLATION=daemon E2E_SIGNAL_RUNNER=TERM E2E_SIGNAL_AFTER_MS=20000 --
 run 13 "daemon isolation, SIGKILL" E2E_ISOLATION=daemon E2E_SIGNAL_RUNNER=KILL E2E_SIGNAL_AFTER_MS=20000 --
@@ -137,4 +149,6 @@ elif [ -z "$only" ] || [[ ",$only," == *",14,"* ]]; then
 fi
 
 echo "matrix: $((ran - failed))/$ran passed$not_run; logs in $out" | tee -a "$summary"
-[ "$ran" -gt 0 ] && [ "$failed" -eq 0 ]
+# The refusal control is part of the matrix: not running it is not a pass,
+# unless --only left it out on purpose.
+[ "$ran" -gt 0 ] && [ "$failed" -eq 0 ] && [ -z "$not_run" ]
