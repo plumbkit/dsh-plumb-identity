@@ -644,6 +644,13 @@ llm-pi-ai:
  * key must be this scenario's too. TSM_ORIG_* companions are stripped because
  * plumb's session-manager hijack recovery would otherwise see a temp XDG
  * override and "recover" it back at the real user state.
+ *
+ * plumb 0.25 resolves its daemon's directories from the OS account and refuses to
+ * launch one without an installed service profile, ignoring every HOME and XDG_*
+ * set here ("serve: ignoring this client's environment for a global directory").
+ * PLUMB_ACCOUNT_AUTHORITY=false is its documented opt-out: the environment-derived
+ * directories and this binary as the daemon, which is what a daemon per scenario
+ * needs. Older plumb ignores the variable.
  */
 function writePlumbWrapper({ root, plumbBin }) {
   const home = path.join(root, 'plumbhome')
@@ -659,6 +666,8 @@ XDG_DATA_HOME='${xdg('.local/share')}'
 XDG_STATE_HOME='${xdg('.local/state')}'
 XDG_CACHE_HOME='${xdg('.cache')}'
 export XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME
+PLUMB_ACCOUNT_AUTHORITY=false
+export PLUMB_ACCOUNT_AUTHORITY
 unset TSM_ORIG_HOME TSM_ORIG_XDG_CONFIG_HOME TSM_ORIG_XDG_DATA_HOME TSM_ORIG_XDG_STATE_HOME TSM_ORIG_XDG_CACHE_HOME
 # On Linux a usable XDG_RUNTIME_DIR wins over HOME for the daemon's socket and
 # lock, which would put this daemon beside the user's real one.
