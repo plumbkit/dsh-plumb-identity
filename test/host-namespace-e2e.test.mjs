@@ -18,7 +18,10 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const VECTORS = JSON.parse(fs.readFileSync(path.join(HERE, 'fixtures', 'host-namespace-vectors.json'), 'utf8'))
 
 const REAL_LISTING = VECTORS.parserCases[0].lines.join('\n')
-const TWO_LISTING = VECTORS.parserCases.find((c) => c.name.startsWith('two daemons')).lines.join('\n')
+const listing = (name) => VECTORS.parserCases.find((c) => c.name === name).lines.join('\n')
+// What plumb prints for two daemons (a VIOLATION verdict), and the same table trimmed of its verdict.
+const TWO_LISTING = listing('two daemons: the authority holder and a stray, under a VIOLATION verdict')
+const TWO_UNJUDGED = listing('two daemons with no verdict line (a trimmed listing): both rows are read')
 
 /**
  * A plumb that only prints and logs (POSIX shell builtins, so it needs no PATH).
@@ -130,8 +133,9 @@ const REFUSED_HOST_CASES = [
   { name: 'an unknown isolation', env: { DSH_E2E_HOST_DAEMON: '48103', E2E_ISOLATION: 'bogus' }, calls: [], why: /bogus/ },
   { name: 'a plumb without namespaces', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { help: 1 }, calls: ['namespace --help'], why: /capability probe/ },
   { name: 'a daemon that does not answer namespace commands', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { list: 1 }, calls: ['namespace --help', 'namespace list --json'], why: /capability probe/ },
-  { name: 'two daemons', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_LISTING, daemonsExit: 1 }, calls: READ_ONLY, why: /plumb debug daemons/ },
-  { name: 'two daemons, even when the census exits 0', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_LISTING }, calls: READ_ONLY, why: /2 daemons/ },
+  { name: 'two daemons, as plumb reports them', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_LISTING, daemonsExit: 1 }, calls: READ_ONLY, why: /verdict was not OK/ },
+  { name: 'two daemons under a VIOLATION verdict, even when the census exits 0', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_LISTING }, calls: READ_ONLY, why: /verdict was not OK/ },
+  { name: 'two daemons with no verdict line, when the census exits 0', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_UNJUDGED }, calls: READ_ONLY, why: /lists 2 daemons/ },
   { name: 'a census that exits non-zero over a listing of the right daemon', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { daemonsExit: 1 }, calls: READ_ONLY, why: /plumb debug daemons/ },
   { name: 'a listing that cannot be read', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: 'hello' }, calls: READ_ONLY, why: /plumb debug daemons/ },
 ]

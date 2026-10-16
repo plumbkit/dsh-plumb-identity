@@ -105,14 +105,14 @@
       "expect": [{"pid": 48103, "authority": true}]
     },
     {
-      "name": "two daemons: the authority holder and a stray (a violation)",
+      "name": "two daemons: the authority holder and a stray, under a VIOLATION verdict",
       "lines": [
         "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
         "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
         "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
         "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
         "",
-        "\u001b[33mVIOLATION\u001b[m — 2 plumb daemons (48103, 50211) where exactly 1 is expected",
+        "\u001b[33mVIOLATION\u001b[m — 2 plumb daemons are running (expected exactly 1): 48103, 50211",
         "",
         "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
         "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
@@ -120,26 +120,25 @@
         "",
         "  Stop the extra daemon (50211) and leave the authority holder (48103)."
       ],
-      "expect": [{"pid": 48103, "authority": true}, {"pid": 50211, "authority": false}]
+      "expect": null
     },
     {
-      "name": "non-ASCII and astral characters in a path, and dashes for the unknown columns",
+      "name": "non-ASCII and astral characters in a path",
       "lines": [
-        "VIOLATION — 2 plumb daemons (48103, 50211) where exactly 1 is expected",
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
         "",
-        "  PID    PPID   STARTED                    EXECUTABLE                AUTHORITY  SOCKET  FOUND BY",
-        "  48103  1      2026-10-16T10:17:10+11:00  /Users/ünï/🙂 plumb/plumb  yes        yes     authority",
-        "  50211  48103  -                          -                         -          -       process"
+        "  PID    PPID  STARTED                    EXECUTABLE                AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /Users/ünï/🙂 plumb/plumb  yes        yes     authority"
       ],
-      "expect": [{"pid": 48103, "authority": true}, {"pid": 50211, "authority": false}]
+      "expect": [{"pid": 48103, "authority": true}]
     },
     {
-      "name": "dashes for the columns the platform could not read",
+      "name": "dashes for the columns the platform could not read (not SOCKET)",
       "lines": [
         "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding the lock",
         "",
         "  PID    PPID  STARTED  EXECUTABLE  AUTHORITY  SOCKET  FOUND BY",
-        "  48103  -     -        -           yes        -       lock"
+        "  48103  -     -        -           yes        yes     lock"
       ],
       "expect": [{"pid": 48103, "authority": true}]
     },
@@ -358,6 +357,260 @@
       "lines": [
         "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
         "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        no      authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "two daemons with no verdict line (a trimmed listing): both rows are read",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "  50211  1     2026-10-16T11:02:44+11:00  /tmp/old build/plumb     -          yes     socket"
+      ],
+      "expect": [{"pid": 48103, "authority": true}, {"pid": 50211, "authority": false}]
+    },
+    {
+      "name": "one daemon that does not hold the authority, with no verdict line",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  -          yes     socket"
+      ],
+      "expect": [{"pid": 48103, "authority": false}]
+    },
+    {
+      "name": "a VIOLATION verdict over a table that reads as one healthy daemon",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[33mVIOLATION\u001b[m — 2 plumb daemons are running (expected exactly 1): 48103, 50211",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an UNKNOWN verdict over a table that reads as one healthy daemon",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[33mUNKNOWN\u001b[m — cannot tell: plumb daemon 48103 is running, but the census could not confirm that it holds the launch authority",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a WARN verdict over a table that reads as one healthy daemon",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "WARN — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an ok verdict that is not spelled OK",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "ok — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an OK verdict that names another PID than the row",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "OK — 1 plumb daemon (48104), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an OK verdict that counts two daemons over one row",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "OK — 2 plumb daemons (48103, 50211), holding the lock",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an OK verdict that counts one daemon over two rows",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "  50211  1     2026-10-16T11:02:44+11:00  /tmp/old build/plumb     -          yes     socket"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an OK verdict that is not the one-daemon sentence",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "OK — everything is fine",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an OK verdict without a PID",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "OK — 1 plumb daemon, holding the lock",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a none verdict over a table",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "none — no plumb daemon is running",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an OK verdict with no table",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  no plumb daemon process was found for this account"
+      ],
+      "expect": null
+    },
+    {
+      "name": "two verdict lines",
+      "lines": [
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a daemon with no socket (SOCKET is a dash)",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        -       authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a renamed header column (STARTED AT)",
+      "lines": [
+        "  PID    PPID  STARTED AT                 EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a header whose AUTHORITY and SOCKET names are swapped",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               SOCKET     AUTHORITY  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a header whose PPID and STARTED names are swapped",
+      "lines": [
+        "  PID    STARTED     PPID               EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a header with an extra trailing column",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY  NOTES",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority  stable"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a header with a column missing (no FOUND BY)",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a lowercase header",
+      "lines": [
+        "  pid    ppid  started                    executable               authority  socket  found by",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
       ],
       "expect": null
     },

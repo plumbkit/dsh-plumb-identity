@@ -23,9 +23,10 @@
 //       * the isolation is `namespace`, never `daemon`, which starts daemons;
 //       * the capability probe passed: the plumb in use has namespaces and a
 //         daemon answered them;
-//       * `plumb debug daemons` lists EXACTLY ONE daemon and it holds the launch
-//         authority (no daemon, two daemons, or a listing that cannot be read
-//         refuse);
+//       * `plumb debug daemons` lists EXACTLY ONE daemon, its own verdict is OK
+//         for that PID, and it holds the launch authority and owns its socket (no
+//         daemon, two daemons, a VIOLATION or UNKNOWN verdict, or a listing that
+//         cannot be read refuse);
 //       * that daemon's PID is the opt-in's, digit for digit.
 // Nothing else counts: no CI=true, no override flag, no case folding, no
 // trimming (a PID with a leading zero or a space is not a PID), and a marker
@@ -115,7 +116,7 @@ export function explainHostNamespace({ env, isolation, probePassed, daemons } = 
   if (listing.error !== undefined) return refuse('daemons', `\`plumb debug daemons\` could not be run: ${listing.error}`)
   const rows = listing.value
   if (!Array.isArray(rows)) {
-    return refuse('daemons', '`plumb debug daemons` could not be read, or did not exit 0 (it does so only when the account has exactly one daemon and it holds the authority)')
+    return refuse('daemons', '`plumb debug daemons` did not report exactly one healthy daemon: it could not be read, did not exit 0 (it does so only when the account has exactly one daemon and it holds the authority), or its verdict was not OK')
   }
   if (rows.length !== 1) {
     return refuse('daemons', `\`plumb debug daemons\` lists ${rows.length} daemons; ${HOST_OPT_IN_ENV} needs exactly one`)
@@ -185,6 +186,10 @@ const HEADER = /^ {2}PID {2,}PPID {2,}STARTED {2,}EXECUTABLE {2,}AUTHORITY {2,}S
 const ROW_START = /^ {2}[0-9]/
 const NO_DAEMON = '  no plumb daemon process was found for this account'
 const UNKNOWN_NOTE = /^ {2}!\s+unknown:/
+// The census's verdict line: `OK — 1 plumb daemon (48103), holding <lock>`, or
+// `none`, `VIOLATION` or `UNKNOWN` with their detail (internal/cli/debug_daemons.go).
+const VERDICT = /^([A-Za-z]+) — (.*)$/
+const OK_DETAIL = /^1 plumb daemon \(([1-9][0-9]*)\)(?:,.*)?$/
 const POSITIVE = /^[1-9][0-9]*$/
 
 /**
@@ -192,7 +197,11 @@ const POSITIVE = /^[1-9][0-9]*$/
  * when it says no daemon was found; null when it cannot be read with certainty.
  * Null is what refuses, so anything this does not recognise is null: a changed
  * layout, a cell that is not what the renderer writes, a census that says it
- * could not read everything.
+ * could not read everything. So is any verdict line but `OK` (a VIOLATION or an
+ * UNKNOWN over a table that happens to read as one healthy daemon), and an `OK`
+ * that does not say exactly one daemon with the PID of the one row. A listing
+ * with no verdict line is read by its table alone. Every daemon must own its
+ * socket: a daemon nobody can reach is not the one a run could use.
  *
  * The listing is a text/tabwriter table (internal/cli/debug_daemons.go in plumb):
  * every cell padded with two spaces to its column's width, so the header's
@@ -205,10 +214,15 @@ export function parseDebugDaemons(text) {
   if (typeof text !== 'string') return null
   const lines = text.replace(ANSI, '').split(/\r?\n/)
   if (lines.some((line) => UNKNOWN_NOTE.test(line))) return null
+  const verdicts = lines.map((line) => VERDICT.exec(line)).filter((match) => match !== null)
+  if (verdicts.length > 1) return null
+  const verdict = verdicts.length === 1 ? { word: verdicts[0][1], detail: verdicts[0][2] } : null
   const headers = lines.flatMap((line, index) => (HEADER.test(line) ? [index] : []))
   const rowLines = lines.flatMap((line, index) => (ROW_START.test(line) ? [index] : []))
   if (headers.length === 0) {
     const none = lines.filter((line) => line === NO_DAEMON).length
+    // `none` is the only verdict that goes with no table.
+    if (verdict !== null && verdict.word !== 'none') return null
     return none === 1 && rowLines.length === 0 ? [] : null
   }
   if (headers.length !== 1 || lines.includes(NO_DAEMON)) return null
@@ -231,6 +245,11 @@ export function parseDebugDaemons(text) {
     daemons.push(daemon)
   }
   if (new Set(daemons.map((d) => d.pid)).size !== daemons.length) return null
+  // An `OK` says one daemon and names it; any other verdict says something is wrong.
+  if (verdict !== null) {
+    const ok = verdict.word === 'OK' ? OK_DETAIL.exec(verdict.detail) : null
+    if (ok === null || daemons.length !== 1 || Number(ok[1]) !== daemons[0].pid) return null
+  }
   return daemons
 }
 
@@ -247,7 +266,7 @@ function parseRow(line, offsets) {
   if (!POSITIVE.test(ppid) && ppid !== '-') return null
   if (started === '' || executable === '') return null
   if (authority !== 'yes' && authority !== '-') return null
-  if (socket !== 'yes' && socket !== '-') return null
+  if (socket !== 'yes') return null
   return { pid: Number(pid), authority: authority === 'yes' }
 }
 
