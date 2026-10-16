@@ -318,6 +318,26 @@
         "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
       ],
       "expect": null
+    },
+    {
+      "name": "a row-like line after the table has ended",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a second header without rows",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "",
+        "  PID  PPID  STARTED  EXECUTABLE  AUTHORITY  SOCKET  FOUND BY"
+      ],
+      "expect": null
     }
   ]
 }

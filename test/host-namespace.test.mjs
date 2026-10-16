@@ -129,8 +129,17 @@ test('hostDecision: a plain host without the opt-in is refused before anything i
   const decision = hostDecision({ env: {}, separate: null, isolation: s.isolation, probePassed: s.probePassed, daemons: s.daemons })
   assert.equal(decision.allow, false)
   assert.equal(decision.condition, 'opt-in')
-  assert.match(decision.why, /DSH_E2E_HOST_DAEMON/)
+  assert.match(decision.why, /not a CI runner, a container or a declared VM, and DSH_E2E_HOST_DAEMON is not set/)
   assert.deepEqual(s.calls, [])
+})
+
+test('hostDecision: only the three kinds of separate environment allow', () => {
+  for (const separate of [true, 'bogus', '', 'Container', 'host-namespace', 1, {}, undefined, null]) {
+    const s = spies()
+    const decision = hostDecision({ env: {}, separate, isolation: s.isolation, probePassed: s.probePassed, daemons: s.daemons })
+    assert.equal(decision.allow, false, JSON.stringify(separate))
+    assert.deepEqual(s.calls, [])
+  }
 })
 
 test('hostDecision: a malformed opt-in is refused before anything is asked', () => {
