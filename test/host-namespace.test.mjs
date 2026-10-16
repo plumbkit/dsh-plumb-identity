@@ -13,9 +13,12 @@ import {
   daemonsFromRun,
   explainHostNamespace,
   HOST_OPT_IN_ENV,
+  hostAcceptanceLine,
   hostDecision,
   hostNamespaceOptIn,
+  hostRecheck,
   parseDebugDaemons,
+  parsePlumbVersion,
   refusal,
 } from './separate-env.mjs'
 
@@ -233,6 +236,79 @@ test('hostDecision agrees with hostNamespaceOptIn on every vector', () => {
     if (decision.allow) assert.equal(decision.kind, 'host-namespace', c.name)
     else assert.equal(decision.condition, c.condition, c.name)
   }
+})
+
+// -- the re-check before each namespace --------------------------------------------------
+
+const ONE_DAEMON = [{ pid: 48103, authority: true }]
+const OPTED_IN = { DSH_E2E_HOST_DAEMON: '48103' }
+
+test('hostRecheck: the daemon the run was accepted for, still the one, passes', () => {
+  assert.equal(hostRecheck({ env: OPTED_IN, daemons: ONE_DAEMON }), null)
+  assert.equal(hostRecheck({ env: OPTED_IN, daemons: () => ONE_DAEMON }), null)
+})
+
+test('hostRecheck: a daemon that restarted or was replaced (another PID) stops the run', () => {
+  const refused = hostRecheck({ env: OPTED_IN, daemons: [{ pid: 51000, authority: true }] })
+  assert.equal(refused?.condition, 'pid')
+  assert.match(refused.why, /48103/)
+  assert.match(refused.why, /51000/)
+})
+
+test('hostRecheck: a second daemon, no daemon, or one without the authority stops the run', () => {
+  const cases = [
+    [[{ pid: 48103, authority: true }, { pid: 51000, authority: false }], 'daemons'],
+    [[], 'daemons'],
+    [[{ pid: 48103, authority: false }], 'authority'],
+    [null, 'daemons'],
+  ]
+  for (const [daemons, condition] of cases) {
+    assert.equal(hostRecheck({ env: OPTED_IN, daemons })?.condition, condition, JSON.stringify(daemons))
+  }
+})
+
+test('hostRecheck: a listing that cannot be run stops the run', () => {
+  const refused = hostRecheck({ env: OPTED_IN, daemons: () => { throw new Error('spawn ETIMEDOUT') } })
+  assert.equal(refused?.condition, 'daemons')
+  assert.match(refused.why, /ETIMEDOUT/)
+})
+
+test('hostRecheck: an opt-in that is gone from the environment stops the run', () => {
+  assert.equal(hostRecheck({ env: {}, daemons: ONE_DAEMON })?.condition, 'opt-in')
+})
+
+test('hostRecheck asks the same question as the decision about the daemon, and no other', () => {
+  for (const c of VECTORS.cases.filter((v) => v.isolation === 'namespace' && v.probePassed === true)) {
+    const refused = hostRecheck({ env: c.env, daemons: c.daemons })
+    assert.equal(refused === null, c.expect === 'host-namespace', c.name)
+  }
+})
+
+// -- what the acceptance line says about the plumb in use ----------------------------------
+
+const VERSION_OUTPUT = [
+  '\u001b[94m╭─╮ ╷        ╷\u001b[m  ',
+  '\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m',
+  '',
+  'plumb v0.26.0 (go1.27.2, rev ea5baa178c1c)',
+  '',
+].join('\n')
+
+test('parsePlumbVersion: the version line of `plumb version`, logo and escapes aside', () => {
+  assert.equal(parsePlumbVersion(VERSION_OUTPUT), 'plumb v0.26.0 (go1.27.2, rev ea5baa178c1c)')
+  assert.equal(parsePlumbVersion('plumb v0.26.0 (go1.27.2, rev ea5baa178c1c)\r\n'), 'plumb v0.26.0 (go1.27.2, rev ea5baa178c1c)')
+})
+
+test('parsePlumbVersion: anything else is unknown', () => {
+  for (const value of [undefined, null, 26, '', 'hello', 'plumb', '  plumb v0.26.0', 'plumb v0.26.0\nplumb v0.27.0']) {
+    assert.equal(parsePlumbVersion(value), null, JSON.stringify(value))
+  }
+})
+
+test('hostAcceptanceLine: names the daemon, the plumb binary in use and its version', () => {
+  const line = hostAcceptanceLine({ pid: 48103, plumbBin: '/opt/homebrew/bin/plumb', version: 'plumb v0.26.0 (go1.27.2, rev ea5baa178c1c)' })
+  assert.equal(line, 'e2e: running on the developer host in namespace isolation against plumb daemon 48103 (DSH_E2E_HOST_DAEMON); plumb binary /opt/homebrew/bin/plumb, plumb v0.26.0 (go1.27.2, rev ea5baa178c1c)')
+  assert.match(hostAcceptanceLine({ pid: 48103, plumbBin: 'plumb', version: null }), /plumb binary plumb, version unknown$/)
 })
 
 // -- the refusal text ----------------------------------------------------------------------

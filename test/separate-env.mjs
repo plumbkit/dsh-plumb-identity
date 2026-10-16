@@ -41,9 +41,14 @@
 // two (the leak the census exists to find) or none the PID would name nothing the
 // run is about. Namespace isolation writes only rows inside namespaces the run
 // created itself, released at each scenario's teardown and leased to the runner's
-// pid so they expire once it is gone; it starts, stops and signals no daemon. The
-// daemon isolation does all of that, so it is never allowed here. The probe is the
-// run's own precondition, taken before any namespace exists.
+// pid so they expire once it is gone; the runner itself starts, stops and signals
+// no daemon. (A `plumb serve` it launches could autostart one if the owner's dies,
+// so the daemon conditions are asked again, as hostRecheck(), before EACH namespace
+// the run creates.) The daemon isolation starts and stops daemons, so it is never
+// allowed here. The probe is the run's own precondition, taken before any
+// namespace exists. The run does not tie the plumb binary in use to the daemon
+// (plumb exposes no daemon version cheaply); the acceptance line prints the binary
+// and its version for the owner to read.
 //
 // Those rules are NOT in separateEnvironment(): that function, and
 // fixtures/separate-env-vectors.json, are byte-identical with plumb's, and the
@@ -176,6 +181,35 @@ export function hostDecision({ env = process.env, separate = null, isolation, pr
   const refused = explainHostNamespace({ env, isolation, probePassed, daemons })
   if (refused !== null) return { allow: false, ...refused }
   return { allow: true, kind: 'host-namespace', pid: Number(env[HOST_OPT_IN_ENV]) }
+}
+
+/**
+ * The daemon conditions of the opt-in asked again, for the run to repeat before
+ * each namespace it creates: the same listing must still show exactly one daemon,
+ * holding the authority, with the PID the owner named. The isolation and the probe
+ * were settled when the run was accepted and are not asked again. A daemon that
+ * restarted or was replaced since (its PID changed, a second one appeared, the
+ * owner's died and a `plumb serve` autostarted another) gets no namespace.
+ * @returns {null | {condition: string, why: string}} why the run must stop, or null
+ */
+export function hostRecheck({ env = process.env, daemons } = {}) {
+  return explainHostNamespace({ env, isolation: 'namespace', probePassed: true, daemons })
+}
+
+/** The version line of `plumb version` (`plumb v0.26.0 (go1.27.2, rev ...)`), or null when it is not exactly one such line. */
+export function parsePlumbVersion(text) {
+  if (typeof text !== 'string') return null
+  const lines = text.replace(ANSI, '').split(/\r?\n/).filter((line) => /^plumb v\S+/.test(line))
+  return lines.length === 1 && lines[0].length <= 200 ? lines[0] : null
+}
+
+/**
+ * The line an accepted opt-in prints: which daemon, and which plumb binary (and
+ * version) is in use. The run does not tie the two together; this puts them side by
+ * side where the owner reads them.
+ */
+export function hostAcceptanceLine({ pid, plumbBin, version }) {
+  return `e2e: running on the developer host in namespace isolation against plumb daemon ${pid} (${HOST_OPT_IN_ENV}); plumb binary ${plumbBin}, ${version ?? 'version unknown'}`
 }
 
 // -- reading `plumb debug daemons` ----------------------------------------------------------

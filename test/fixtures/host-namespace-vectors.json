@@ -615,6 +615,21 @@
       "expect": null
     },
     {
+      "name": "one daemon, a different PID: the owner's was replaced",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (51000), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  51000  1     2026-10-16T11:30:02+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": [{"pid": 51000, "authority": true}]
+    },
+    {
       "name": "a second header without rows",
       "lines": [
         "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",

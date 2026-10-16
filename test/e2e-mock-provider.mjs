@@ -43,7 +43,10 @@
 // daemons` lists>, accepted only for namespace isolation and a plumb that passed
 // the capability probe (separate-env.mjs has the whole rule). It is decided in
 // main() before a scenario root, a namespace or a signal handler exists, and a
-// run it refuses prints why and exits 2.
+// run it refuses prints why and exits 2. An accepted run prints the plumb binary
+// and version it uses, and repeats the daemon check before EACH namespace it
+// creates: if the daemon is no longer that one daemon (restarted, replaced, a
+// second appeared) the run releases what it holds, prints why and exits 1.
 //
 // E2E_ISOLATION=namespace|daemon   default namespace. Namespace mode probes the
 //                                  plumb in use first and REFUSES (exit 2) when it
@@ -64,7 +67,7 @@ import { fileURLToPath } from 'node:url'
 import { createFakeModel, TYPED_SESSION_ID } from './fake-model.mjs'
 import { endProcessGroup, stopIsolatedDaemon, walkDirs } from './isolated-daemon.mjs'
 import { createNamespaceEnvironment, NamespaceUnavailable, probeNamespaceSupport, resolveIsolation, runPlumb, selectIsolation } from './namespace-mode.mjs'
-import { daemonsFromRun, HOST_OPT_IN_ENV, hostDecision, refusal, separateEnvironment } from './separate-env.mjs'
+import { daemonsFromRun, HOST_OPT_IN_ENV, hostAcceptanceLine, hostDecision, hostRecheck, parsePlumbVersion, refusal, separateEnvironment } from './separate-env.mjs'
 import { readRecordsUnder } from './session-records.mjs'
 import { installSignalTeardown } from './signal-teardown.mjs'
 
@@ -339,6 +342,15 @@ let shuttingDown = false
 // main() runs (and resolves it) before the rest of this module has been evaluated.
 let resolvedPlumb = null
 
+// Host mode (the owner's opt-in): the daemon's PID the run was accepted for, or null.
+// Before each namespace the run creates, the daemon is looked at again; if it is no
+// longer that one daemon the scenario is refused, and `stopReason` ends the run.
+let hostPid = null
+let stopReason = null
+
+/** The daemon the owner named is no longer the one daemon: no namespace is created in whatever replaced it. */
+class HostDaemonChanged extends Error {}
+
 /** Installed by main() once the host decision is made, so a refused run has no handler. */
 function installTeardownHandler() {
   installSignalTeardown({
@@ -392,8 +404,28 @@ function requireHostDecision() {
     process.exit(2)
   }
   if (decision.kind === 'host-namespace') {
-    console.log(`e2e: running on the developer host in namespace isolation against plumb daemon ${decision.pid} (${HOST_OPT_IN_ENV})`)
+    hostPid = decision.pid
+    // The run does not tie the plumb binary to the daemon; print both where the owner reads them.
+    const plumbBin = resolvePlumb()
+    const result = runPlumb(plumbBin, ['version'], { timeoutMs: 15_000 })
+    const version = result.error || result.signal || result.status !== 0 ? null : parsePlumbVersion(result.stdout)
+    console.log(hostAcceptanceLine({ pid: decision.pid, plumbBin, version }))
   }
+}
+
+/**
+ * Whether the daemon this host-mode run was accepted for is still the one daemon,
+ * asked again before each namespace is created (a restart or a replacement since
+ * would otherwise get namespaces written into it). The reason it is not, or null.
+ * Nothing to ask outside host mode: a separate environment has its own daemon.
+ */
+function hostDaemonChange() {
+  if (hostPid === null) return null
+  const refused = hostRecheck({
+    env: process.env,
+    daemons: () => daemonsFromRun(runPlumb(resolvePlumb(), ['debug', 'daemons'], { env: { NO_COLOR: '1' }, timeoutMs: 15_000 })),
+  })
+  return refused === null ? null : `the daemon ${HOST_OPT_IN_ENV} named (${hostPid}) is no longer the one daemon to use: ${refused.why}`
 }
 
 async function main() {
@@ -428,12 +460,21 @@ async function main() {
 
   let failures = 0
   for (const mode of wanted) {
-    if (shuttingDown) break
+    if (shuttingDown || stopReason !== null) break
     const passed = await runScenario({ mode, task: SCENARIOS[mode].task, harness, plumbBin, isolation, keep })
     if (!passed) failures += 1
   }
   // A signal handler is tearing down and will exit with 128 + its signal.
   if (shuttingDown) return new Promise(() => {})
+  // A stopped run (the host daemon changed) releases whatever it still holds.
+  if (stopReason !== null && isolation.ledger) {
+    const { released, problems } = isolation.ledger.releaseAll()
+    for (const id of released) console.error(`  released namespace ${id}`)
+    for (const problem of problems) {
+      console.error(`  FAIL ${problem}`)
+      failures += 1
+    }
+  }
   // Every namespace this run created must be revoked by now: one left active
   // would sit in the shared daemon until its TTL ran out.
   const left = isolation.ledger?.outstanding() ?? []
@@ -441,6 +482,7 @@ async function main() {
     console.error(`  FAIL namespaces: ${left.length} namespace(s) were never released: ${left.join(', ')}`)
     failures += 1
   }
+  if (stopReason !== null) console.error(`\ne2e: STOPPED: ${stopReason}`)
   console.log(failures === 0 ? `\ne2e: all ${wanted.length} scenario(s) passed` : `\ne2e: ${failures} scenario(s) FAILED`)
   process.exit(failures === 0 ? 0 : 1)
 }
@@ -532,6 +574,7 @@ async function runScenario({ mode, task, harness, plumbBin, isolation, keep }) {
     }
   } catch (error) {
     console.error(`  FAIL ${mode}: ${error.message}`)
+    if (error instanceof HostDaemonChanged) stopReason = error.message
   } finally {
     // End dsh and any serve it left before tearing the isolation down, or that
     // serve redials the daemon (in daemon mode: starts a new one). First, so a
@@ -556,7 +599,8 @@ async function runScenario({ mode, task, harness, plumbBin, isolation, keep }) {
       }
       liveEnvironments.delete(root)
     }
-    if (passed && !keep) fs.rmSync(root, { recursive: true, force: true })
+    // A scenario refused before it began (the host daemon changed) ran nothing to debug.
+    if ((passed || (stopReason !== null && environment === null)) && !keep) fs.rmSync(root, { recursive: true, force: true })
     else console.log(`  (kept for debugging: ${root})`)
   }
   return passed
@@ -593,7 +637,10 @@ function createEnvironment({ isolation, root, plumbBin }) {
     }
   }
 
-  // Namespace mode: see createNamespaceEnvironment.
+  // Namespace mode: see createNamespaceEnvironment. In host mode, look at the daemon
+  // again first, so a restart or replacement since the last look gets no namespace.
+  const change = hostDaemonChange()
+  if (change !== null) throw new HostDaemonChanged(change)
   return createNamespaceEnvironment({ ledger: isolation.ledger, files: isolation.files, root, plumbBin })
 }
 

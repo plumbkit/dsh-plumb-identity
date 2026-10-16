@@ -12,7 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { fakePlumb } from './fake-plumb.mjs'
+import { FAKE_VERSION, fakePlumb } from './fake-plumb.mjs'
 import { separateEnvironment } from './separate-env.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -27,7 +27,7 @@ const TWO_UNJUDGED = listing('two daemons with no verdict line (a trimmed listin
 // A preload that records how many signal handlers the process holds when it exits.
 const LISTENER_PROBE = path.join(HERE, 'fixtures', 'listener-probe.mjs')
 
-function runE2E(t, { env: extra = {}, args = [], plumb = {} } = {}) {
+function runE2E(t, { env: extra = {}, args = [], plumb = {}, dsh = false } = {}) {
   const env = { ...process.env }
   for (const key of ['GITHUB_ACTIONS', 'PLUMB_SEPARATE_ENV', 'E2E_ISOLATION', 'PLUMB_NAMESPACE', 'DSH_E2E_HOST_DAEMON']) delete env[key]
   if (separateEnvironment({ env }) !== null) {
@@ -45,13 +45,24 @@ function runE2E(t, { env: extra = {}, args = [], plumb = {} } = {}) {
   env.DSH_HOME = path.join(dir, 'dsh-home')
   env.PLUMB_BIN = fake.bin
   env.PATH = '/nonexistent'
+  if (dsh) {
+    // A dsh that does nothing and exits 0, under a node_modules directory as the
+    // harness expects. With it a scenario runs to its assertions (which fail: the
+    // fake daemon has no session records) and its namespace is created and released.
+    const hoisted = path.join(dir, 'node_modules')
+    fs.mkdirSync(path.join(hoisted, 'fake-dsh'), { recursive: true })
+    env.DSH_BIN = path.join(hoisted, 'fake-dsh', 'dsh')
+    fs.writeFileSync(env.DSH_BIN, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  }
   const probeOut = path.join(dir, 'signal-listeners.json')
   env.LISTENER_PROBE_OUT = probeOut
   const run = spawnSync(process.execPath, ['--import', LISTENER_PROBE, path.join(HERE, 'e2e-mock-provider.mjs'), ...args], { env, encoding: 'utf8', timeout: 30_000 })
   const created = fs.readdirSync('/tmp').filter((n) => n.startsWith('dsh-identity-e2e-') && !before.has(n))
+  // Roots a failed scenario keeps for debugging are this test's to remove.
+  if (dsh) t.after(() => created.forEach((name) => fs.rmSync(path.join('/tmp', name), { recursive: true, force: true })))
   // [SIGINT, SIGTERM, SIGHUP] handlers held at exit; null if the probe never wrote.
   const listeners = fs.existsSync(probeOut) ? JSON.parse(fs.readFileSync(probeOut, 'utf8')) : null
-  return { run, calls: fake.calls(), created, listeners }
+  return { run, calls: fake.calls(), created, listeners, bin: fake.bin }
 }
 
 const READ_ONLY = ['namespace --help', 'namespace list --json', 'debug daemons']
@@ -86,7 +97,7 @@ for (const args of [['--isolation'], ['--list']]) {
   })
 }
 
-test('the e2e on a host with the opt-in for the one authority daemon: --isolation and --list run, after three read-only plumb commands', (t) => {
+test('the e2e on a host with the opt-in for the one authority daemon: --isolation and --list run, after four read-only plumb commands', (t) => {
   for (const args of [['--isolation'], ['--list']]) {
     const r = runE2E(t, { env: { DSH_E2E_HOST_DAEMON: '48103' }, args })
     if (r === null) return
@@ -94,10 +105,67 @@ test('the e2e on a host with the opt-in for the one authority daemon: --isolatio
     assert.match(r.run.stdout, /^e2e: running on the developer host in namespace isolation against plumb daemon 48103/m)
     if (args[0] === '--isolation') assert.match(r.run.stdout, /^namespace$/m)
     else assert.match(r.run.stdout, /^tool-call$/m)
-    assert.deepEqual(r.calls, READ_ONLY, 'only the probe and the listing ran: no namespace create, no restart')
+    assert.ok(r.run.stdout.includes(`; plumb binary ${r.bin}, ${FAKE_VERSION}\n`), `the acceptance line names the plumb binary and its version\n${r.run.stdout}`)
+    assert.deepEqual(r.calls, [...READ_ONLY, 'version'], 'only the probe, the listing and the version ran: no namespace create, no restart')
     assert.deepEqual(r.created, [], 'no scenario root was created')
     assert.deepEqual(r.listeners, [1, 1, 1], 'an accepted run installs the teardown handler (so the zero below means something)')
   }
+})
+
+test('a plumb that will not say its version is still accepted, and the line says so', (t) => {
+  const r = runE2E(t, { env: { DSH_E2E_HOST_DAEMON: '48103' }, args: ['--list'], plumb: { version: null } })
+  if (r === null) return
+  assert.equal(r.run.status, 0, `exit ${r.run.status}\n${r.run.stdout}\n${r.run.stderr}`)
+  assert.ok(r.run.stdout.includes(`; plumb binary ${r.bin}, version unknown\n`), r.run.stdout)
+  assert.deepEqual(r.calls, [...READ_ONLY, 'version'])
+})
+
+// The daemon is looked at again before every namespace the run creates. The fake's
+// n-th `debug daemons` prints the n-th listing: the 1st is the decision, the 2nd
+// the re-check before the first scenario, the 3rd before the second.
+const OWNER = { DSH_E2E_HOST_DAEMON: '48103' }
+const REPLACED = listing('one daemon, a different PID: the owner\'s was replaced')
+const THREE = ['--mode', 'text-only', '--mode', 'text-only', '--mode', 'text-only']
+const countOf = (calls, prefix) => calls.filter((c) => c === prefix || c.startsWith(`${prefix} `)).length
+
+test('the e2e re-checks the daemon before each namespace: a replaced daemon gets none, and the run stops', (t) => {
+  const r = runE2E(t, { env: OWNER, args: THREE, plumb: { listings: [REAL_LISTING, REAL_LISTING, REPLACED] }, dsh: true })
+  if (r === null) return
+  assert.equal(r.run.status, 1, `exit ${r.run.status}\n${r.run.stdout}\n${r.run.stderr}`)
+  assert.equal(countOf(r.calls, 'debug daemons'), 3, 'the decision and one re-check per scenario started')
+  assert.equal(countOf(r.calls, 'namespace create'), 1, 'only the first scenario got a namespace')
+  assert.equal(countOf(r.calls, 'namespace release'), 1, 'and released it')
+  assert.equal((r.run.stdout.match(/=== text-only ===/g) ?? []).length, 2, 'the third scenario never started')
+  assert.match(r.run.stderr, /e2e: STOPPED: .*48103.*51000/s)
+  assert.doesNotMatch(r.run.stderr, /never released/, 'nothing it held was left active')
+})
+
+test('the e2e re-checks before the FIRST namespace too: a daemon replaced since the decision gets none', (t) => {
+  const r = runE2E(t, { env: OWNER, args: THREE, plumb: { listings: [REAL_LISTING, REPLACED] }, dsh: true })
+  if (r === null) return
+  assert.equal(r.run.status, 1, `exit ${r.run.status}\n${r.run.stdout}\n${r.run.stderr}`)
+  assert.equal(countOf(r.calls, 'namespace create'), 0)
+  assert.equal(countOf(r.calls, 'namespace release'), 0)
+  assert.equal((r.run.stdout.match(/=== text-only ===/g) ?? []).length, 1)
+  assert.match(r.run.stderr, /e2e: STOPPED: /)
+  assert.deepEqual(r.created, [], 'the scenario that was refused left no root behind')
+})
+
+test('the e2e re-checks and carries on while the daemon is unchanged (the control)', (t) => {
+  const r = runE2E(t, { env: OWNER, args: ['--mode', 'text-only', '--mode', 'text-only'], plumb: { listings: [REAL_LISTING] }, dsh: true })
+  if (r === null) return
+  assert.equal(countOf(r.calls, 'debug daemons'), 3)
+  assert.equal(countOf(r.calls, 'namespace create'), 2)
+  assert.equal(countOf(r.calls, 'namespace release'), 2)
+  assert.equal((r.run.stdout.match(/=== text-only ===/g) ?? []).length, 2)
+  assert.doesNotMatch(r.run.stderr, /STOPPED/)
+})
+
+test('separate-environment evidence needs no re-check: no listing is read before a namespace', (t) => {
+  const r = runE2E(t, { env: { GITHUB_ACTIONS: 'true' }, args: ['--mode', 'text-only', '--mode', 'text-only'], dsh: true })
+  if (r === null) return
+  assert.equal(countOf(r.calls, 'debug daemons'), 0)
+  assert.equal(countOf(r.calls, 'namespace create'), 2)
 })
 
 const REFUSED_HOST_CASES = [
