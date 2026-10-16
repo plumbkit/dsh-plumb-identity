@@ -241,7 +241,6 @@ function parseRow(line, offsets) {
   for (const offset of offsets.slice(1)) {
     if (chars[offset - 1] !== ' ' || chars[offset - 2] !== ' ') return null
   }
-  if (chars.length <= offsets[5]) return null
   const cell = (n) => chars.slice(offsets[n], offsets[n + 1] ?? chars.length).join('').trimEnd()
   const [pid, ppid, started, executable, authority, socket] = [0, 1, 2, 3, 4, 5].map(cell)
   if (!POSITIVE.test(pid) || !Number.isSafeInteger(Number(pid))) return null

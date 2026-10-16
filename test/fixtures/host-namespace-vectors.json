@@ -330,6 +330,38 @@
       "expect": null
     },
     {
+      "name": "an executable that runs into the AUTHORITY column (no padding)",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumbabyes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an executable with one space of padding before AUTHORITY",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumba yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an AUTHORITY value that does not start at its column",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb   yes       yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a SOCKET cell that is neither yes nor a dash",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        no      authority"
+      ],
+      "expect": null
+    },
+    {
       "name": "a second header without rows",
       "lines": [
         "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",

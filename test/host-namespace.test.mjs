@@ -91,6 +91,7 @@ test('daemonsFromRun: only a clean exit is read', () => {
   // listing to act on, whatever the text says.
   assert.equal(daemonsFromRun({ status: 1, signal: null, error: null, stdout }), null)
   assert.equal(daemonsFromRun({ status: null, signal: 'SIGTERM', error: null, stdout }), null)
+  assert.equal(daemonsFromRun({ status: 0, signal: 'SIGTERM', error: null, stdout }), null)
   assert.equal(daemonsFromRun({ status: 0, signal: null, error: new Error('ETIMEDOUT'), stdout }), null)
   assert.equal(daemonsFromRun({ status: null, signal: null, error: null, stdout }), null)
   assert.equal(daemonsFromRun(null), null)

@@ -47,6 +47,9 @@ function fakePlumb(dir, { listing = REAL_LISTING, daemonsExit = 0, help = 0, lis
   return { bin, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []) }
 }
 
+// A preload that records how many signal handlers the process holds when it exits.
+const LISTENER_PROBE = path.join(HERE, 'fixtures', 'listener-probe.mjs')
+
 function runE2E(t, { env: extra = {}, args = [], plumb = {} } = {}) {
   const env = { ...process.env }
   for (const key of ['GITHUB_ACTIONS', 'PLUMB_SEPARATE_ENV', 'E2E_ISOLATION', 'PLUMB_NAMESPACE', 'DSH_E2E_HOST_DAEMON']) delete env[key]
@@ -64,9 +67,13 @@ function runE2E(t, { env: extra = {}, args = [], plumb = {} } = {}) {
   env.DSH_HOME = path.join(dir, 'dsh-home')
   env.PLUMB_BIN = fake.bin
   env.PATH = '/nonexistent'
-  const run = spawnSync(process.execPath, [path.join(HERE, 'e2e-mock-provider.mjs'), ...args], { env, encoding: 'utf8', timeout: 30_000 })
+  const probeOut = path.join(dir, 'signal-listeners.json')
+  env.LISTENER_PROBE_OUT = probeOut
+  const run = spawnSync(process.execPath, ['--import', LISTENER_PROBE, path.join(HERE, 'e2e-mock-provider.mjs'), ...args], { env, encoding: 'utf8', timeout: 30_000 })
   const created = fs.readdirSync('/tmp').filter((n) => n.startsWith('dsh-identity-e2e-') && !before.has(n))
-  return { run, calls: fake.calls(), created }
+  // [SIGINT, SIGTERM, SIGHUP] handlers held at exit; null if the probe never wrote.
+  const listeners = fs.existsSync(probeOut) ? JSON.parse(fs.readFileSync(probeOut, 'utf8')) : null
+  return { run, calls: fake.calls(), created, listeners }
 }
 
 const READ_ONLY = ['namespace --help', 'namespace list --json', 'debug daemons']
@@ -82,6 +89,22 @@ for (const args of [['--mode', 'tool-call'], ['--isolation'], ['--list']]) {
     assert.equal(r.run.stdout.trim(), '')
     assert.deepEqual(r.calls, [], 'the fake plumb was never run')
     assert.deepEqual(r.created, [], 'no scenario root was created')
+    assert.deepEqual(r.listeners, [0, 0, 0], 'no signal handler was installed')
+  })
+}
+
+// Separate evidence still decides on its own. GITHUB_ACTIONS=true is accepted on any
+// OS, so this runs the real decision on a host with only --list/--isolation, which
+// print and exit before anything is created.
+for (const args of [['--isolation'], ['--list']]) {
+  test(`the e2e with separate-environment evidence is allowed without the opt-in and asks plumb nothing (${args.join(' ')})`, (t) => {
+    const r = runE2E(t, { env: { GITHUB_ACTIONS: 'true' }, args })
+    if (r === null) return
+    assert.equal(r.run.status, 0, `exit ${r.run.status}\n${r.run.stdout}\n${r.run.stderr}`)
+    assert.doesNotMatch(r.run.stdout, /developer host/)
+    assert.deepEqual(r.calls, [], 'the fake plumb was never run')
+    assert.deepEqual(r.created, [])
+    assert.deepEqual(r.listeners, [1, 1, 1])
   })
 }
 
@@ -95,6 +118,7 @@ test('the e2e on a host with the opt-in for the one authority daemon: --isolatio
     else assert.match(r.run.stdout, /^tool-call$/m)
     assert.deepEqual(r.calls, READ_ONLY, 'only the probe and the listing ran: no namespace create, no restart')
     assert.deepEqual(r.created, [], 'no scenario root was created')
+    assert.deepEqual(r.listeners, [1, 1, 1], 'an accepted run installs the teardown handler (so the zero below means something)')
   }
 })
 
@@ -124,6 +148,7 @@ for (const c of REFUSED_HOST_CASES) {
       assert.equal(r.run.stdout.trim(), '', 'a refused run prints nothing on stdout')
       assert.deepEqual(r.calls, c.calls)
       assert.deepEqual(r.created, [], 'no scenario root was created')
+      assert.deepEqual(r.listeners, [0, 0, 0], 'no signal handler was installed')
     })
   }
 }
