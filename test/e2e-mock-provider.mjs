@@ -56,14 +56,16 @@
 // --isolation                      print the isolation this run would use and exit
 //
 // Requirements: a dsh install (DSH_BIN, else the $DSH_HOME / ~/.dsh profile
-// tree, exactly what dsh itself resolves) and a plumb binary (PLUMB_BIN, else
-// ../plumb/plumb beside this checkout, else `plumb` on PATH).
+// tree, else the one dsh in the npx cache; see dsh-launcher.mjs) and a plumb
+// binary (PLUMB_BIN, else ../plumb/plumb beside this checkout, else `plumb` on
+// PATH).
 
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { findDshLauncher } from './dsh-launcher.mjs'
 import { createFakeModel, TYPED_SESSION_ID } from './fake-model.mjs'
 import { endProcessGroup, stopIsolatedDaemon, walkDirs } from './isolated-daemon.mjs'
 import { createNamespaceEnvironment, NamespaceUnavailable, probeNamespaceSupport, resolveIsolation, runPlumb, selectIsolation } from './namespace-mode.mjs'
@@ -926,35 +928,15 @@ async function pollFor(probe, timeoutMs) {
 
 // -- process + path resolution helpers ----------------------------------------------
 
-/** Resolve the dsh launcher: DSH_BIN, else the profile tree dsh itself uses. */
+/** Resolve the dsh launcher (dsh-launcher.mjs has the order). */
 function resolveHarness() {
-  const candidates = []
-  if (process.env.DSH_BIN) candidates.push(process.env.DSH_BIN)
-  const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
-  candidates.push(path.join(dshHome, 'profiles', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'))
-  const bin = candidates.find((p) => fs.existsSync(p))
-  if (!bin) {
-    throw new Error('no dsh install found — set DSH_BIN to your dsh launcher (or dsh lib/bin.js)')
-  }
-  const hoisted = nearestNodeModules(bin)
-  if (!hoisted) {
-    throw new Error(`cannot locate the hoisted profile node_modules above ${bin} — set DSH_BIN to a path under the profile tree`)
-  }
+  const { bin, hoisted } = findDshLauncher()
   return {
     label: bin,
     bin,
     hoisted,
     argv: (args) => (bin.endsWith('.js') ? [process.execPath, bin, ...args] : [bin, ...args]),
   }
-}
-
-function nearestNodeModules(from) {
-  let dir = path.dirname(path.resolve(from))
-  for (let i = 0; i < 8 && dir !== path.parse(dir).root; i += 1) {
-    if (path.basename(dir) === 'node_modules') return dir
-    dir = path.dirname(dir)
-  }
-  return null
 }
 
 /** Resolve the plumb binary: PLUMB_BIN, ../plumb/plumb, or PATH. Once: the host decision and the run use the same one. */

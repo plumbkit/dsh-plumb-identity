@@ -100,6 +100,33 @@ test('daemonsFromRun: only a clean exit is read', () => {
   assert.equal(daemonsFromRun(null), null)
 })
 
+test('daemonsFromRun: a listing without its verdict line is not acted on, though its table reads', () => {
+  // plumb prints exactly one verdict line on every path (verdictLine in
+  // internal/cli/debug_daemons.go), so a listing without one has been cut.
+  const lines = VECTORS.parserCases[0].lines
+  const cut = lines.filter((line) => !line.replace(/\x1b\[[0-9;]*m/g, '').startsWith('OK — '))
+  assert.equal(cut.length, lines.length - 1, 'exactly the verdict line was cut')
+  const stdout = `${cut.join('\n')}\n`
+  // The control: the table alone still reads as the right daemon.
+  assert.deepEqual(parseDebugDaemons(stdout), [{ pid: 48103, authority: true }])
+  assert.equal(parseDebugDaemons(stdout, { requireVerdict: true }), null)
+  assert.equal(daemonsFromRun({ status: 0, signal: null, error: null, stdout }), null)
+  const refused = explainHostNamespace({ env: { [HOST_OPT_IN_ENV]: '48103' }, isolation: 'namespace', probePassed: true, daemons: () => daemonsFromRun({ status: 0, signal: null, error: null, stdout }) })
+  assert.equal(refused?.condition, 'daemons')
+  assert.match(refused.why, /had no verdict line/)
+})
+
+test('the pid and authority refusals do not name the daemon\'s PID', () => {
+  const env = { [HOST_OPT_IN_ENV]: '48104' }
+  const wrong = explainHostNamespace({ env, isolation: 'namespace', probePassed: true, daemons: [{ pid: 48103, authority: true }] })
+  assert.equal(wrong?.condition, 'pid')
+  assert.match(wrong.why, /48104 is not the PID of the one running daemon/)
+  assert.doesNotMatch(wrong.why, /48103/)
+  const unheld = explainHostNamespace({ env, isolation: 'namespace', probePassed: true, daemons: [{ pid: 48103, authority: false }] })
+  assert.equal(unheld?.condition, 'authority')
+  assert.doesNotMatch(unheld.why, /48103/)
+})
+
 // -- the decision, with a spy on everything it may do -----------------------------------
 
 function spies({ isolation = 'namespace', probePassed = true, daemons = [{ pid: 48103, authority: true }] } = {}) {
@@ -224,7 +251,7 @@ test('hostDecision: a stale PID (the daemon restarted since the recipe was writt
   assert.equal(decision.allow, false)
   assert.equal(decision.condition, 'pid')
   assert.match(decision.why, /48103/)
-  assert.match(decision.why, /51000/)
+  assert.doesNotMatch(decision.why, /51000/, 'the daemon\'s PID is not handed out')
   // The reason a refused opt-in prints is read by whoever set it; it carries no recipe.
   assert.doesNotMatch(decision.why, /plumb debug daemons/)
 })
@@ -252,7 +279,7 @@ test('hostRecheck: a daemon that restarted or was replaced (another PID) stops t
   const refused = hostRecheck({ env: OPTED_IN, daemons: [{ pid: 51000, authority: true }] })
   assert.equal(refused?.condition, 'pid')
   assert.match(refused.why, /48103/)
-  assert.match(refused.why, /51000/)
+  assert.doesNotMatch(refused.why, /51000/, 'the daemon\'s PID is not handed out')
 })
 
 test('hostRecheck: a second daemon, no daemon, or one without the authority stops the run', () => {

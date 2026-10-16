@@ -73,8 +73,8 @@ for (const c of HOST_CASES) {
     const dshHome = fs.mkdtempSync(path.join(os.tmpdir(), 'sepenv-dsh-'))
     t.after(() => fs.rmSync(dshHome, { recursive: true, force: true }))
     const before = new Set(fs.readdirSync('/tmp').filter((n) => n.startsWith('dsh-identity-e2e-')))
-    // Nothing a run past the guard needs can resolve: no dsh (DSH_BIN missing,
-    // DSH_HOME empty), so it would throw "no dsh install found" with exit 1 before
+    // Nothing a run past the guard needs can resolve: no dsh (DSH_BIN names a
+    // launcher that does not exist), so it would throw "DSH_BIN=/nonexistent/dsh does not exist" with exit 1 before
     // any scenario, and the only plumb is a fake script (fake-plumb.mjs), never the
     // sibling ../plumb/plumb the e2e falls back to when PLUMB_BIN does not exist.
     // A broken guard therefore fails this test, and shows in the fake's log,

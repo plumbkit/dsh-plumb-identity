@@ -121,7 +121,7 @@ export function explainHostNamespace({ env, isolation, probePassed, daemons } = 
   if (listing.error !== undefined) return refuse('daemons', `\`plumb debug daemons\` could not be run: ${listing.error}`)
   const rows = listing.value
   if (!Array.isArray(rows)) {
-    return refuse('daemons', '`plumb debug daemons` did not report exactly one healthy daemon: it could not be read, did not exit 0 (it does so only when the account has exactly one daemon and it holds the authority), or its verdict was not OK')
+    return refuse('daemons', '`plumb debug daemons` did not report exactly one healthy daemon: it could not be read, did not exit 0 (it does so only when the account has exactly one daemon and it holds the authority), had no verdict line, or its verdict was not OK')
   }
   if (rows.length !== 1) {
     return refuse('daemons', `\`plumb debug daemons\` lists ${rows.length} daemons; ${HOST_OPT_IN_ENV} needs exactly one`)
@@ -129,10 +129,12 @@ export function explainHostNamespace({ env, isolation, probePassed, daemons } = 
   const [daemon] = rows
   if (typeof daemon !== 'object' || daemon === null) return refuse('daemons', '`plumb debug daemons` listed a row that is not a daemon')
   if (daemon.authority !== true) {
-    return refuse('authority', `the one daemon (${JSON.stringify(daemon.pid ?? null)}) does not hold the launch authority`)
+    return refuse('authority', 'the one daemon does not hold the launch authority')
   }
   if (!Number.isSafeInteger(daemon.pid) || String(daemon.pid) !== optIn) {
-    return refuse('pid', `${HOST_OPT_IN_ENV}=${optIn} is not the running daemon's PID (${JSON.stringify(daemon.pid ?? null)}): the PID changes whenever the daemon restarts, so the owner names it afresh each run`)
+    // The refusal does not name the daemon's PID: a reader that could copy it from
+    // here would not have to look at the daemon, which is what naming it is for.
+    return refuse('pid', `${HOST_OPT_IN_ENV}=${optIn} is not the PID of the one running daemon: the PID changes whenever the daemon restarts, so the owner names it afresh each run`)
   }
   return null
 }
@@ -234,8 +236,10 @@ const POSITIVE = /^[1-9][0-9]*$/
  * could not read everything. So is any verdict line but `OK` (a VIOLATION or an
  * UNKNOWN over a table that happens to read as one healthy daemon), and an `OK`
  * that does not say exactly one daemon with the PID of the one row. A listing
- * with no verdict line is read by its table alone. Every daemon must own its
- * socket: a daemon nobody can reach is not the one a run could use.
+ * with no verdict line is read by its table alone, unless `requireVerdict` is
+ * set: the run sets it (daemonsFromRun), because plumb always prints a verdict,
+ * so a listing without one has been cut. Every daemon must own its socket: a
+ * daemon nobody can reach is not the one a run could use.
  *
  * The listing is a text/tabwriter table (internal/cli/debug_daemons.go in plumb):
  * every cell padded with two spaces to its column's width, so the header's
@@ -244,12 +248,12 @@ const POSITIVE = /^[1-9][0-9]*$/
  * Colour escapes and the logo are not part of it.
  * @returns {{pid: number, authority: boolean}[] | null}
  */
-export function parseDebugDaemons(text) {
+export function parseDebugDaemons(text, { requireVerdict = false } = {}) {
   if (typeof text !== 'string') return null
   const lines = text.replace(ANSI, '').split(/\r?\n/)
   if (lines.some((line) => UNKNOWN_NOTE.test(line))) return null
   const verdicts = lines.map((line) => VERDICT.exec(line)).filter((match) => match !== null)
-  if (verdicts.length > 1) return null
+  if (verdicts.length > 1 || (requireVerdict && verdicts.length === 0)) return null
   const verdict = verdicts.length === 1 ? { word: verdicts[0][1], detail: verdicts[0][2] } : null
   const headers = lines.flatMap((line, index) => (HEADER.test(line) ? [index] : []))
   const rowLines = lines.flatMap((line, index) => (ROW_START.test(line) ? [index] : []))
@@ -309,11 +313,12 @@ function parseRow(line, offsets) {
  * (`{status, signal, error, stdout}`, as namespace-mode's runPlumb returns). It
  * exits 0 only when the account has exactly one daemon and it holds the
  * authority and no socket is where it should not be, so any other exit is not a
- * listing to act on, whatever the text says.
+ * listing to act on, whatever the text says. It always prints a verdict line, so
+ * a listing without exactly one is not acted on either.
  */
 export function daemonsFromRun(result) {
   if (!result || result.error || result.signal || result.status !== 0) return null
-  return parseDebugDaemons(result.stdout)
+  return parseDebugDaemons(result.stdout, { requireVerdict: true })
 }
 
 /**

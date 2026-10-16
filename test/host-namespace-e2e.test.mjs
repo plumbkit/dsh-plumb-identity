@@ -23,6 +23,8 @@ const listing = (name) => VECTORS.parserCases.find((c) => c.name === name).lines
 // What plumb prints for two daemons (a VIOLATION verdict), and the same table trimmed of its verdict.
 const TWO_LISTING = listing('two daemons: the authority holder and a stray, under a VIOLATION verdict')
 const TWO_UNJUDGED = listing('two daemons with no verdict line (a trimmed listing): both rows are read')
+// The real listing with its verdict line cut: the table alone reads as the right daemon.
+const ONE_UNJUDGED = REAL_LISTING.split('\n').filter((line) => !/^(\x1b\[[0-9;]*m)?OK(\x1b\[[0-9;]*m)? — /.test(line)).join('\n')
 
 // A preload that records how many signal handlers the process holds when it exits.
 const LISTENER_PROBE = path.join(HERE, 'fixtures', 'listener-probe.mjs')
@@ -143,7 +145,9 @@ test('the e2e re-checks the daemon before each namespace: a replaced daemon gets
   assert.equal(countOf(r.calls, 'namespace create'), 1, 'only the first scenario got a namespace')
   assert.equal(countOf(r.calls, 'namespace release'), 1, 'and released it')
   assert.equal((r.run.stdout.match(/=== text-only ===/g) ?? []).length, 2, 'the third scenario never started')
-  assert.match(r.run.stderr, /e2e: STOPPED: .*48103.*51000/s)
+  assert.match(r.run.stderr, /e2e: STOPPED: .*48103.*is not the PID of the one running daemon/s)
+  // The new daemon's PID is not handed out: whoever re-runs reads it from the daemon.
+  assert.doesNotMatch(r.run.stderr, /51000/)
   assert.doesNotMatch(r.run.stderr, /never released/, 'nothing it held was left active')
 })
 
@@ -189,7 +193,7 @@ test('separate-environment evidence needs no re-check: no listing is read before
 })
 
 const REFUSED_HOST_CASES = [
-  { name: 'a PID that is not the daemon\'s', env: { DSH_E2E_HOST_DAEMON: '48104' }, calls: READ_ONLY, why: /48104.*48103/s },
+  { name: 'a PID that is not the daemon\'s', env: { DSH_E2E_HOST_DAEMON: '48104' }, calls: READ_ONLY, why: /48104 is not the PID of the one running daemon/, hidden: /48103/ },
   { name: 'a stale recipe: a PID with a leading zero', env: { DSH_E2E_HOST_DAEMON: '048103' }, calls: [], why: /plain decimal PID/ },
   { name: 'an empty opt-in', env: { DSH_E2E_HOST_DAEMON: '' }, calls: [], why: /plain decimal PID/ },
   { name: 'daemon isolation', env: { DSH_E2E_HOST_DAEMON: '48103', E2E_ISOLATION: 'daemon' }, calls: [], why: /namespace isolation only/ },
@@ -198,7 +202,8 @@ const REFUSED_HOST_CASES = [
   { name: 'a daemon that does not answer namespace commands', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { list: 1 }, calls: ['namespace --help', 'namespace list --json'], why: /capability probe/ },
   { name: 'two daemons, as plumb reports them', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_LISTING, daemonsExit: 1 }, calls: READ_ONLY, why: /verdict was not OK/ },
   { name: 'two daemons under a VIOLATION verdict, even when the census exits 0', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_LISTING }, calls: READ_ONLY, why: /verdict was not OK/ },
-  { name: 'two daemons with no verdict line, when the census exits 0', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_UNJUDGED }, calls: READ_ONLY, why: /lists 2 daemons/ },
+  { name: 'two daemons with no verdict line, when the census exits 0', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: TWO_UNJUDGED }, calls: READ_ONLY, why: /had no verdict line/ },
+  { name: 'the right daemon with no verdict line, when the census exits 0', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: ONE_UNJUDGED }, calls: READ_ONLY, why: /had no verdict line/ },
   { name: 'a census that exits non-zero over a listing of the right daemon', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { daemonsExit: 1 }, calls: READ_ONLY, why: /plumb debug daemons/ },
   { name: 'a listing that cannot be read', env: { DSH_E2E_HOST_DAEMON: '48103' }, plumb: { listing: 'hello' }, calls: READ_ONLY, why: /plumb debug daemons/ },
 ]
@@ -212,6 +217,7 @@ for (const c of REFUSED_HOST_CASES) {
       assert.match(r.run.stderr, /refusing to run here/)
       assert.match(r.run.stderr, /not to start, stop or write namespaces into/)
       assert.match(r.run.stderr, c.why)
+      if (c.hidden) assert.doesNotMatch(r.run.stderr, c.hidden, 'the refusal does not hand out the daemon\'s PID')
       assert.equal(r.run.stdout.trim(), '', 'a refused run prints nothing on stdout')
       assert.deepEqual(r.calls, c.calls)
       assert.deepEqual(r.created, [], 'no scenario root was created')
