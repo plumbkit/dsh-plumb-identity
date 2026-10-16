@@ -112,6 +112,13 @@ test('the e2e on a host with the opt-in for the one authority daemon: --isolatio
   }
 })
 
+test('a plumb whose `version` fails is not believed, even if it printed a line first', (t) => {
+  const r = runE2E(t, { env: { DSH_E2E_HOST_DAEMON: '48103' }, args: ['--list'], plumb: { versionExit: 1 } })
+  if (r === null) return
+  assert.equal(r.run.status, 0, `exit ${r.run.status}\n${r.run.stdout}\n${r.run.stderr}`)
+  assert.ok(r.run.stdout.includes(`; plumb binary ${r.bin}, version unknown\n`), r.run.stdout)
+})
+
 test('a plumb that will not say its version is still accepted, and the line says so', (t) => {
   const r = runE2E(t, { env: { DSH_E2E_HOST_DAEMON: '48103' }, args: ['--list'], plumb: { version: null } })
   if (r === null) return
@@ -138,6 +145,19 @@ test('the e2e re-checks the daemon before each namespace: a replaced daemon gets
   assert.equal((r.run.stdout.match(/=== text-only ===/g) ?? []).length, 2, 'the third scenario never started')
   assert.match(r.run.stderr, /e2e: STOPPED: .*48103.*51000/s)
   assert.doesNotMatch(r.run.stderr, /never released/, 'nothing it held was left active')
+})
+
+test('a stopped run releases a namespace its scenario could not (and says so)', (t) => {
+  // The first scenario's own release fails; the run stops before the second; the
+  // stop retries the release, which this time succeeds.
+  const r = runE2E(t, { env: OWNER, args: THREE, plumb: { listings: [REAL_LISTING, REAL_LISTING, REPLACED], releaseFails: 1 }, dsh: true })
+  if (r === null) return
+  assert.equal(r.run.status, 1, `exit ${r.run.status}\n${r.run.stdout}\n${r.run.stderr}`)
+  assert.equal(countOf(r.calls, 'namespace create'), 1)
+  assert.equal(countOf(r.calls, 'namespace release'), 2, 'the scenario\'s release, then the stop\'s retry')
+  assert.match(r.run.stderr, /released namespace ns-fake1/)
+  assert.match(r.run.stderr, /e2e: STOPPED: /)
+  assert.doesNotMatch(r.run.stderr, /never released/)
 })
 
 test('the e2e re-checks before the FIRST namespace too: a daemon replaced since the decision gets none', (t) => {

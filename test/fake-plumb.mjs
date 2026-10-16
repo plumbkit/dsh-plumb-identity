@@ -14,6 +14,7 @@
 //   service show                a `[dirs]` table under the fake's own directory
 //   namespace create ...        a fresh token and ns-fake<N> id
 //   namespace release --json    revokes the namespace whose token is in PLUMB_NAMESPACE
+//                               (the first `releaseFails` calls exit 1 instead)
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -22,12 +23,13 @@ export const FAKE_VERSION = 'plumb v0.26.0 (go1.27.2, rev ea5baa178c1c)'
 
 /**
  * @param {string} dir  where the script, its listings, counters and log live
- * @param {{listings: string[], daemonsExit?: number, help?: number, list?: number, version?: string|null}} options
+ * @param {{listings: string[], daemonsExit?: number, help?: number, list?: number, version?: string|null, versionExit?: number, releaseFails?: number}} options
  *   `listings`: what successive `plumb debug daemons` calls print. `version`: the
- *   line `plumb version` prints, or null to make it fail.
+ *   line `plumb version` prints, or null to print nothing and fail; `versionExit`
+ *   its exit status.
  * @returns {{bin: string, dir: string, calls: () => string[]}}
  */
-export function fakePlumb(dir, { listings, daemonsExit = 0, help = 0, list = 0, version = FAKE_VERSION } = {}) {
+export function fakePlumb(dir, { listings, daemonsExit = 0, help = 0, list = 0, version = FAKE_VERSION, versionExit = 0, releaseFails = 0 } = {}) {
   if (!Array.isArray(listings) || listings.length === 0) throw new Error('fakePlumb: listings must name what `debug daemons` prints')
   const log = path.join(dir, 'plumb-calls.log')
   listings.forEach((text, i) => fs.writeFileSync(path.join(dir, `listing-${i + 1}.txt`), `${text}\n`))
@@ -37,7 +39,7 @@ export function fakePlumb(dir, { listings, daemonsExit = 0, help = 0, list = 0, 
   const bin = path.join(dir, 'plumb')
   const versionArm = version === null
     ? "  version::) printf 'no version\\n' >&2; exit 1 ;;"
-    : `  version::) printf '%s\\n' ' ╭─╮ logo' '${version}'; exit 0 ;;`
+    : `  version::) printf '%s\\n' ' ╭─╮ logo' '${version}'; exit ${versionExit} ;;`
   fs.writeFileSync(bin, [
     '#!/bin/sh',
     `D='${dir}'`,
@@ -54,7 +56,8 @@ export function fakePlumb(dir, { listings, daemonsExit = 0, help = 0, list = 0, 
     `    exit ${daemonsExit} ;;`,
     `  service:show:) printf '[dirs]\\ndata = %s\\nlog = %s\\n' "'${data}'" "'${logs}'"; exit 0 ;;`,
     '  namespace:create:*) count create; printf \'{"token":"tok-fake%s","namespace":{"id":"ns-fake%s"}}\\n\' "$n" "$n"; exit 0 ;;',
-    '  namespace:release:*) printf \'{"namespace":{"id":"ns-fake%s","state":"revoked"}}\\n\' "${PLUMB_NAMESPACE#tok-fake}"; exit 0 ;;',
+    `  namespace:release:*) count release; if [ "$n" -le ${releaseFails} ]; then printf 'release failed\\n' >&2; exit 1; fi`,
+    '    printf \'{"namespace":{"id":"ns-fake%s","state":"revoked"}}\\n\' "${PLUMB_NAMESPACE#tok-fake}"; exit 0 ;;',
     'esac',
     "printf 'unknown command\\n' >&2",
     'exit 1',
