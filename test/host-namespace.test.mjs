@@ -222,7 +222,8 @@ test('hostDecision: a stale PID (the daemon restarted since the recipe was writt
   assert.equal(decision.condition, 'pid')
   assert.match(decision.why, /48103/)
   assert.match(decision.why, /51000/)
-  assert.match(decision.why, /plumb debug daemons/)
+  // The reason a refused opt-in prints is read by whoever set it; it carries no recipe.
+  assert.doesNotMatch(decision.why, /plumb debug daemons/)
 })
 
 test('hostDecision agrees with hostNamespaceOptIn on every vector', () => {
@@ -236,13 +237,18 @@ test('hostDecision agrees with hostNamespaceOptIn on every vector', () => {
 
 // -- the refusal text ----------------------------------------------------------------------
 
-test('the refusal still says what it said, and now names the opt-in and how to find the PID', () => {
+test('the refusal still says what it said, and says the opt-in is the owner\'s, with no recipe for it', () => {
   const text = refusal('e2e')
   assert.match(text, /refusing to run here/)
   assert.match(text, /not to start, stop or write namespaces into/)
   assert.match(text, /GITHUB_ACTIONS=true/)
   assert.match(text, /PLUMB_SEPARATE_ENV=vm/)
-  assert.match(text, /DSH_E2E_HOST_DAEMON=<pid>/)
-  assert.match(text, /plumb debug daemons/)
-  assert.match(text, /namespace isolation only/)
+  assert.match(text, /OWNER ONLY/)
+  assert.match(text, /An agent must not set DSH_E2E_HOST_DAEMON; ask the owner\. See README\./)
+  // Whoever is refused reads this. It names the variable only to forbid it: no
+  // value to give it, no command that finds one (that recipe is in the README).
+  assert.doesNotMatch(text, /DSH_E2E_HOST_DAEMON=/)
+  assert.doesNotMatch(text, /<pid>/)
+  assert.doesNotMatch(text, /plumb debug daemons/)
+  assert.doesNotMatch(text, /namespace isolation only/)
 })

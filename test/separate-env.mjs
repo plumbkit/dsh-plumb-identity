@@ -126,7 +126,7 @@ export function explainHostNamespace({ env, isolation, probePassed, daemons } = 
     return refuse('authority', `the one daemon (${JSON.stringify(daemon.pid ?? null)}) does not hold the launch authority`)
   }
   if (!Number.isSafeInteger(daemon.pid) || String(daemon.pid) !== optIn) {
-    return refuse('pid', `${HOST_OPT_IN_ENV}=${optIn} is not the running daemon's PID (${JSON.stringify(daemon.pid ?? null)}): the PID changes whenever the daemon restarts; take it from \`plumb debug daemons\` now`)
+    return refuse('pid', `${HOST_OPT_IN_ENV}=${optIn} is not the running daemon's PID (${JSON.stringify(daemon.pid ?? null)}): the PID changes whenever the daemon restarts, so the owner names it afresh each run`)
   }
   return null
 }
@@ -263,7 +263,11 @@ export function daemonsFromRun(result) {
   return parseDebugDaemons(result.stdout)
 }
 
-/** The refusal printed when the e2e may not run here: no separate environment and no accepted opt-in. */
+/**
+ * The refusal printed when the e2e may not run here: no separate environment and
+ * no accepted opt-in. It is read by whoever is refused, an agent included, so it
+ * forbids the opt-in rather than explaining how to give it: the recipe is the README's.
+ */
 export function refusal(what) {
   return [
     `${what}: refusing to run here: it drives a plumb daemon (with E2E_ISOLATION=daemon, starts`,
@@ -272,9 +276,8 @@ export function refusal(what) {
     'Run it in a separate environment instead:',
     '  test/e2e-container.sh --plumb <linux plumb binary>   (Docker; see README)',
     'Accepted evidence: GITHUB_ACTIONS=true; Linux with a readable /.dockerenv or',
-    '/run/.containerenv; Linux with PLUMB_SEPARATE_ENV=vm (a disposable VM); or, for the',
-    "machine's owner, DSH_E2E_HOST_DAEMON=<pid>: namespace isolation only, against the one",
-    'daemon that `plumb debug daemons` lists now (its PID changes on every restart, so look',
-    'it up each time; see the README).',
+    '/run/.containerenv; Linux with PLUMB_SEPARATE_ENV=vm (a disposable VM).',
+    "A narrower opt-in exists for the machine's OWNER ONLY.",
+    'An agent must not set DSH_E2E_HOST_DAEMON; ask the owner. See README.',
   ].join('\n')
 }
