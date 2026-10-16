@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { fakePlumb } from './fake-plumb.mjs'
 import { CONTAINER_MARKERS, readableFile, separateEnvironment } from './separate-env.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -61,6 +62,9 @@ for (const c of HOST_CASES) {
     delete env.PLUMB_SEPARATE_ENV
     delete env.E2E_ISOLATION
     delete env.PLUMB_NAMESPACE
+    // The owner's opt-in is not this test's to inherit: an exported one would send the
+    // child past the early refusal, to a plumb of its own choosing.
+    delete env.DSH_E2E_HOST_DAEMON
     // Only a container marker can still make the child's environment separate.
     if (separateEnvironment({ env }) !== null) {
       t.skip('this process runs in a container')
@@ -71,12 +75,15 @@ for (const c of HOST_CASES) {
     const before = new Set(fs.readdirSync('/tmp').filter((n) => n.startsWith('dsh-identity-e2e-')))
     // Nothing a run past the guard needs can resolve: no dsh (DSH_BIN missing,
     // DSH_HOME empty), so it would throw "no dsh install found" with exit 1 before
-    // any scenario, and no plumb on PATH. A broken guard therefore fails this test
+    // any scenario, and the only plumb is a fake script (fake-plumb.mjs), never the
+    // sibling ../plumb/plumb the e2e falls back to when PLUMB_BIN does not exist.
+    // A broken guard therefore fails this test, and shows in the fake's log,
     // without starting a daemon or creating a namespace.
+    const fake = fakePlumb(dshHome, { listings: [''] })
     Object.assign(env, c.env)
     env.DSH_BIN = '/nonexistent/dsh'
     env.DSH_HOME = dshHome
-    env.PLUMB_BIN = '/nonexistent/plumb'
+    env.PLUMB_BIN = fake.bin
     env.PATH = '/nonexistent'
     const run = spawnSync(process.execPath, [path.join(HERE, 'e2e-mock-provider.mjs'), ...c.args], { env, encoding: 'utf8', timeout: 30_000 })
     assert.equal(run.status, 2, `exit ${run.status}\n${run.stdout}\n${run.stderr}`)
@@ -84,6 +91,7 @@ for (const c of HOST_CASES) {
     assert.match(run.stderr, /not to start, stop or write namespaces into/)
     assert.doesNotMatch(run.stdout, /e2e: (harness|isolation)/)
     assert.equal(run.stdout.trim(), '', 'a refused run prints nothing, not even a scenario list or an isolation')
+    assert.deepEqual(fake.calls(), [], 'plumb was never run')
     const after = fs.readdirSync('/tmp').filter((n) => n.startsWith('dsh-identity-e2e-') && !before.has(n))
     assert.deepEqual(after, [], 'no scenario root was created')
   })

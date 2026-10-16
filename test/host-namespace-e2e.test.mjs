@@ -1,6 +1,6 @@
 // The e2e's host decision (test/separate-env.mjs hostDecision, wired in
 // e2e-mock-provider.mjs) as a child process. The only plumb it can reach is a FAKE
-// one, a shell script that prints canned output and logs its arguments, so nothing
+// one (fake-plumb.mjs), a shell script that prints canned output and logs its arguments, so nothing
 // here starts, stops, signals or talks to a real daemon; and every run stops at the
 // decision or at --list/--isolation, which print and exit before a scenario root,
 // a namespace or a harness exists.
@@ -12,6 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { fakePlumb } from './fake-plumb.mjs'
 import { separateEnvironment } from './separate-env.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -22,33 +23,6 @@ const listing = (name) => VECTORS.parserCases.find((c) => c.name === name).lines
 // What plumb prints for two daemons (a VIOLATION verdict), and the same table trimmed of its verdict.
 const TWO_LISTING = listing('two daemons: the authority holder and a stray, under a VIOLATION verdict')
 const TWO_UNJUDGED = listing('two daemons with no verdict line (a trimmed listing): both rows are read')
-
-/**
- * A plumb that only prints and logs (POSIX shell builtins, so it needs no PATH).
- * It answers exactly the three read-only commands the decision runs, and exits 1
- * with "unknown command" for anything else, which the log then shows. `listing`
- * is what `plumb debug daemons` prints; `daemonsExit` its exit status; `help` and
- * `list` the namespace probe.
- */
-function fakePlumb(dir, { listing = REAL_LISTING, daemonsExit = 0, help = 0, list = 0 } = {}) {
-  const log = path.join(dir, 'plumb-calls.log')
-  const listingFile = path.join(dir, 'listing.txt')
-  fs.writeFileSync(listingFile, `${listing}\n`)
-  const bin = path.join(dir, 'plumb')
-  fs.writeFileSync(bin, [
-    '#!/bin/sh',
-    `printf '%s\\n' "$*" >> '${log}'`,
-    'case "$1:$2:$3" in',
-    `  namespace:--help:*) printf 'create renew release list\\n'; exit ${help} ;;`,
-    `  namespace:list:--json) printf 'null\\n'; exit ${list} ;;`,
-    `  debug:daemons:) while IFS= read -r line; do printf '%s\\n' "$line"; done < '${listingFile}'; exit ${daemonsExit} ;;`,
-    'esac',
-    "printf 'unknown command\\n' >&2",
-    'exit 1',
-    '',
-  ].join('\n'), { mode: 0o755 })
-  return { bin, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : []) }
-}
 
 // A preload that records how many signal handlers the process holds when it exits.
 const LISTENER_PROBE = path.join(HERE, 'fixtures', 'listener-probe.mjs')
@@ -62,7 +36,8 @@ function runE2E(t, { env: extra = {}, args = [], plumb = {} } = {}) {
   }
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hostns-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
-  const fake = fakePlumb(dir, plumb)
+  const { listing = REAL_LISTING, listings = [listing], ...options } = plumb
+  const fake = fakePlumb(dir, { listings, ...options })
   const before = new Set(fs.readdirSync('/tmp').filter((n) => n.startsWith('dsh-identity-e2e-')))
   Object.assign(env, extra)
   // Nothing past the decision can resolve: no dsh, and the only plumb is the fake.
