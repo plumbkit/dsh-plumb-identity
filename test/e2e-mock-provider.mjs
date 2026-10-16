@@ -32,12 +32,18 @@
 //   --keep / E2E_KEEP=1                    keep temp roots for debugging
 //   --list                                 print the scenario names and exit
 //
-// Where: never on a developer machine. The suite refuses to start (exit 2)
-// unless separate-env.mjs finds a CI runner, a container or a declared VM,
-// whichever isolation is chosen: a namespace run still talks to a daemon, and a
-// developer machine's one daemon is not a test's to talk to. test/e2e-container.sh
-// runs it in Docker, starts the one daemon namespace mode needs, and checks that
-// exactly one daemon ran and none outlives it.
+// Where: not on a developer machine, unless its owner says so. The suite refuses
+// to start (exit 2) unless separate-env.mjs finds a CI runner, a container or a
+// declared VM, whichever isolation is chosen: a namespace run still talks to a
+// daemon, and a developer machine's one daemon is not a test's to talk to.
+// test/e2e-container.sh runs it in Docker, starts the one daemon namespace mode
+// needs, and checks that exactly one daemon ran and none outlives it.
+//
+// The owner's exception is DSH_E2E_HOST_DAEMON=<pid of the one daemon `plumb debug
+// daemons` lists>, accepted only for namespace isolation and a plumb that passed
+// the capability probe (separate-env.mjs has the whole rule). It is decided in
+// main() before a scenario root, a namespace or a signal handler exists, and a
+// run it refuses prints why and exits 2.
 //
 // E2E_ISOLATION=namespace|daemon   default namespace. Namespace mode probes the
 //                                  plumb in use first and REFUSES (exit 2) when it
@@ -57,15 +63,18 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createFakeModel, TYPED_SESSION_ID } from './fake-model.mjs'
 import { endProcessGroup, stopIsolatedDaemon, walkDirs } from './isolated-daemon.mjs'
-import { createNamespaceEnvironment, NamespaceUnavailable, resolveIsolation, selectIsolation } from './namespace-mode.mjs'
-import { refusal, separateEnvironment } from './separate-env.mjs'
+import { createNamespaceEnvironment, NamespaceUnavailable, probeNamespaceSupport, resolveIsolation, runPlumb, selectIsolation } from './namespace-mode.mjs'
+import { daemonsFromRun, HOST_OPT_IN_ENV, hostDecision, refusal, separateEnvironment } from './separate-env.mjs'
 import { readRecordsUnder } from './session-records.mjs'
 import { installSignalTeardown } from './signal-teardown.mjs'
 
 // Either isolation drives a plumb daemon (a developer host's one daemon is not a
 // test's), so refuse on a developer host before resolving anything, creating a
-// root, creating a namespace or installing a signal handler.
-if (separateEnvironment() === null) {
+// root, creating a namespace or installing a signal handler. The one exception is
+// the owner's opt-in, which needs the isolation and the plumb in use to be judged:
+// main() decides it first thing (requireHostDecision), before any of those exist.
+const SEPARATE = separateEnvironment()
+if (SEPARATE === null && process.env[HOST_OPT_IN_ENV] === undefined) {
   console.error(refusal('e2e'))
   process.exit(2)
 }
@@ -325,11 +334,19 @@ const liveEnvironments = new Map() // root -> environment
 const liveGroups = new Set()
 // Set by the handler: main starts no further scenario and leaves the exit to it.
 let shuttingDown = false
-installSignalTeardown({
-  environments: liveEnvironments,
-  endGroups: endDshGroups,
-  onSignal: () => { shuttingDown = true },
-})
+
+// The plumb binary in use, resolved once. Declared here, not beside resolvePlumb:
+// main() runs (and resolves it) before the rest of this module has been evaluated.
+let resolvedPlumb = null
+
+/** Installed by main() once the host decision is made, so a refused run has no handler. */
+function installTeardownHandler() {
+  installSignalTeardown({
+    environments: liveEnvironments,
+    endGroups: endDshGroups,
+    onSignal: () => { shuttingDown = true },
+  })
+}
 
 /** End every dsh process group still recorded, with whatever serves it holds. */
 async function endDshGroups() {
@@ -349,7 +366,39 @@ main().catch((error) => {
   process.exit(error instanceof NamespaceUnavailable ? 2 : 1)
 })
 
+/**
+ * Whether this run may be here, decided before anything is created: not at all
+ * (exit 2, with the condition that refused), or on a separate environment, or on
+ * the developer host by the owner's opt-in. The probe and the listing it asks
+ * for are read-only plumb commands (`namespace --help`, `namespace list --json`,
+ * `debug daemons`); nothing is started, signalled or created.
+ */
+function requireHostDecision() {
+  let probe = null
+  const decision = hostDecision({
+    env: process.env,
+    separate: SEPARATE,
+    isolation: () => selectIsolation(process.env).mode,
+    probePassed: () => {
+      probe = probeNamespaceSupport(resolvePlumb())
+      return probe.ok
+    },
+    daemons: () => daemonsFromRun(runPlumb(resolvePlumb(), ['debug', 'daemons'], { env: { NO_COLOR: '1' }, timeoutMs: 15_000 })),
+  })
+  if (!decision.allow) {
+    console.error(`e2e: ${HOST_OPT_IN_ENV} was not accepted: ${decision.why}`)
+    if (probe && !probe.ok) console.error(`e2e: the probe said: ${probe.detail}`)
+    console.error(refusal('e2e'))
+    process.exit(2)
+  }
+  if (decision.kind === 'host-namespace') {
+    console.log(`e2e: running on the developer host in namespace isolation against plumb daemon ${decision.pid} (${HOST_OPT_IN_ENV})`)
+  }
+}
+
 async function main() {
+  requireHostDecision()
+  installTeardownHandler()
   const args = process.argv.slice(2)
   // The scenario names, one per line: test/container/run.sh checks the run
   // passed every one of them, so a scenario that never ran cannot pass.
@@ -861,8 +910,13 @@ function nearestNodeModules(from) {
   return null
 }
 
-/** Resolve the plumb binary: PLUMB_BIN, ../plumb/plumb, or PATH. */
+/** Resolve the plumb binary: PLUMB_BIN, ../plumb/plumb, or PATH. Once: the host decision and the run use the same one. */
 function resolvePlumb() {
+  resolvedPlumb ??= findPlumb()
+  return resolvedPlumb
+}
+
+function findPlumb() {
   const candidates = [
     process.env.PLUMB_BIN,
     path.join(REPO_ROOT, '..', 'plumb', 'plumb'),
