@@ -1,0 +1,323 @@
+{
+  "comment": "Vectors for hostNamespaceOptIn and parseDebugDaemons (test/separate-env.mjs): the fourth kind of evidence for the e2e's host guard, narrower than the three separateEnvironment() accepts and deliberately NOT part of them, so this file is separate from separate-env-vectors.json, which stays byte-identical with plumb's. `cases`: hostNamespaceOptIn({env, isolation, probePassed, daemons}) must give `expect`; a case that expects null names the `condition` that must be the one that refuses (opt-in | isolation | probe | daemons | authority | pid), so a vector cannot pass by tripping a different check than the one it is about. `parserCases`: parseDebugDaemons(lines.join(\"\\n\") + \"\\n\") must give `expect`, [{pid, authority}] in the order listed, [] for \"no daemon\", or null when the output cannot be read with certainty. The first parser case is `plumb debug daemons` from plumb 0.26.0 as it prints, with the home directory made generic.",
+  "cases": [
+    {"name": "the opt-in, namespace isolation, a passed probe, one authority daemon with that PID", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": "host-namespace"},
+    {"name": "other environment variables are neither needed nor evidence", "env": {"DSH_E2E_HOST_DAEMON": "48103", "PLUMB_NAMESPACE": "pns1-0123456789abcdef", "CI": "true", "PLUMB_SEPARATE_ENV": "vm", "E2E_ISOLATION": "namespace"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": "host-namespace"},
+    {"name": "a daemon row carries more than the two fields the rule reads", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true, "executable": "/opt/homebrew/bin/plumb"}], "expect": "host-namespace"},
+    {"name": "a large PID", "env": {"DSH_E2E_HOST_DAEMON": "4194304"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 4194304, "authority": true}], "expect": "host-namespace"},
+    {"name": "no environment at all", "env": {}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is empty", "env": {"DSH_E2E_HOST_DAEMON": ""}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is 0", "env": {"DSH_E2E_HOST_DAEMON": "0"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 0, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in has a leading zero", "env": {"DSH_E2E_HOST_DAEMON": "048103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in has a leading space", "env": {"DSH_E2E_HOST_DAEMON": " 48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in has a trailing space", "env": {"DSH_E2E_HOST_DAEMON": "48103 "}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in has a trailing newline", "env": {"DSH_E2E_HOST_DAEMON": "48103\n"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is negative", "env": {"DSH_E2E_HOST_DAEMON": "-48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in has a plus sign", "env": {"DSH_E2E_HOST_DAEMON": "+48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is hexadecimal", "env": {"DSH_E2E_HOST_DAEMON": "0xBBE7"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is a decimal fraction", "env": {"DSH_E2E_HOST_DAEMON": "48103.0"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is in exponent form", "env": {"DSH_E2E_HOST_DAEMON": "4.8103e4"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is fullwidth digits", "env": {"DSH_E2E_HOST_DAEMON": "４８１０３"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is a word", "env": {"DSH_E2E_HOST_DAEMON": "true"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is 1, the usual flag value: a PID, but not the daemon's", "env": {"DSH_E2E_HOST_DAEMON": "1"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "pid"},
+    {"name": "the opt-in is two PIDs", "env": {"DSH_E2E_HOST_DAEMON": "48103,50211"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the opt-in is a number, not a string", "env": {"DSH_E2E_HOST_DAEMON": 48103}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "opt-in"},
+    {"name": "the daemon isolation is never allowed on a host", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "daemon", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "isolation"},
+    {"name": "the isolation is not named exactly", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "Namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "isolation"},
+    {"name": "the isolation is empty", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "isolation"},
+    {"name": "the isolation is unknown", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": null, "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "isolation"},
+    {"name": "the capability probe failed", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": false, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "probe"},
+    {"name": "the capability probe result is not a boolean", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": "true", "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "probe"},
+    {"name": "the capability probe result is unknown", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": null, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "probe"},
+    {"name": "zero daemons", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [], "expect": null, "condition": "daemons"},
+    {"name": "two daemons, one with the opt-in's PID and the authority", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}, {"pid": 50211, "authority": false}], "expect": null, "condition": "daemons"},
+    {"name": "two daemons, both holding the authority", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}, {"pid": 50211, "authority": true}], "expect": null, "condition": "daemons"},
+    {"name": "two daemons, the opt-in names the one without the authority", "env": {"DSH_E2E_HOST_DAEMON": "50211"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}, {"pid": 50211, "authority": false}], "expect": null, "condition": "daemons"},
+    {"name": "the same daemon listed twice", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}, {"pid": 48103, "authority": true}], "expect": null, "condition": "daemons"},
+    {"name": "the one daemon does not hold the authority", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": false}], "expect": null, "condition": "authority"},
+    {"name": "authority is the string yes, not true", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": "yes"}], "expect": null, "condition": "authority"},
+    {"name": "authority is missing", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103}], "expect": null, "condition": "authority"},
+    {"name": "the daemon's PID differs from the opt-in", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48104, "authority": true}], "expect": null, "condition": "pid"},
+    {"name": "the opt-in is a prefix of the daemon's PID", "env": {"DSH_E2E_HOST_DAEMON": "4810"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "pid"},
+    {"name": "the daemon's PID is a prefix of the opt-in's", "env": {"DSH_E2E_HOST_DAEMON": "481030"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "pid"},
+    {"name": "the daemon's PID is a string, not what the parser returns", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"pid": "48103", "authority": true}], "expect": null, "condition": "pid"},
+    {"name": "the daemon's PID is missing", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [{"authority": true}], "expect": null, "condition": "pid"},
+    {"name": "the listing could not be parsed (null)", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": null, "expect": null, "condition": "daemons"},
+    {"name": "the listing is not a list", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": {"pid": 48103, "authority": true}, "expect": null, "condition": "daemons"},
+    {"name": "the listing is a string", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": "48103", "expect": null, "condition": "daemons"},
+    {"name": "the row is not an object", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [48103], "expect": null, "condition": "daemons"},
+    {"name": "the row is null", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "daemons": [null], "expect": null, "condition": "daemons"},
+    {"name": "no isolation given", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "probePassed": true, "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "isolation"},
+    {"name": "no probe result given", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "daemons": [{"pid": 48103, "authority": true}], "expect": null, "condition": "probe"},
+    {"name": "no daemon listing given", "env": {"DSH_E2E_HOST_DAEMON": "48103"}, "isolation": "namespace", "probePassed": true, "expect": null, "condition": "daemons"}
+  ],
+  "parserCases": [
+    {
+      "name": "the real output, as plumb prints it (logo and colour escapes)",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": [{"pid": 48103, "authority": true}]
+    },
+    {
+      "name": "the real output with the escapes and the logo stripped",
+      "lines": [
+        "",
+        "OK — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": [{"pid": 48103, "authority": true}]
+    },
+    {
+      "name": "a CRLF line ending",
+      "lines": [
+        "\r",
+        "OK — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`\r",
+        "\r",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY\r",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority\r"
+      ],
+      "expect": [{"pid": 48103, "authority": true}]
+    },
+    {
+      "name": "an executable path with a space in it",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE                 AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /Users/dev/My Tools/plumb  yes        yes     authority"
+      ],
+      "expect": [{"pid": 48103, "authority": true}]
+    },
+    {
+      "name": "two daemons: the authority holder and a stray (a violation)",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[33mVIOLATION\u001b[m — 2 plumb daemons (48103, 50211) where exactly 1 is expected",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "  50211  1     2026-10-16T11:02:44+11:00  /tmp/old build/plumb     -          yes     socket",
+        "",
+        "  Stop the extra daemon (50211) and leave the authority holder (48103)."
+      ],
+      "expect": [{"pid": 48103, "authority": true}, {"pid": 50211, "authority": false}]
+    },
+    {
+      "name": "non-ASCII and astral characters in a path, and dashes for the unknown columns",
+      "lines": [
+        "VIOLATION — 2 plumb daemons (48103, 50211) where exactly 1 is expected",
+        "",
+        "  PID    PPID   STARTED                    EXECUTABLE                AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1      2026-10-16T10:17:10+11:00  /Users/ünï/🙂 plumb/plumb  yes        yes     authority",
+        "  50211  48103  -                          -                         -          -       process"
+      ],
+      "expect": [{"pid": 48103, "authority": true}, {"pid": 50211, "authority": false}]
+    },
+    {
+      "name": "dashes for the columns the platform could not read",
+      "lines": [
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding the lock",
+        "",
+        "  PID    PPID  STARTED  EXECUTABLE  AUTHORITY  SOCKET  FOUND BY",
+        "  48103  -     -        -           yes        -       lock"
+      ],
+      "expect": [{"pid": 48103, "authority": true}]
+    },
+    {
+      "name": "a socket note and a legacy bridge note after the table",
+      "lines": [
+        "\u001b[32mOK\u001b[m — 1 plumb daemon (48103), holding `/Users/dev/Library/Application Support/plumb/daemon.authority.lock`",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "  \u001b[33m!\u001b[m /Users/dev/Library/Caches/plumb/daemon.sock: a socket file nothing serves",
+        "  \u001b[2m-\u001b[m legacy bridge /Users/dev/.plumb/mcp.sock: the account's daemon answers old clients here; no client has used it since the daemon started"
+      ],
+      "expect": [{"pid": 48103, "authority": true}]
+    },
+    {
+      "name": "no daemon at all",
+      "lines": [
+        "\u001b[94m╭─╮ ╷        ╷\u001b[m  ",
+        "\u001b[94m┣━┛ ┃ ╷  ┏┳┓ ┣━┓\u001b[m",
+        "\u001b[94m╵   ╵ ┃┃ ╵╵╵ ╰─╯\u001b[m",
+        "\u001b[94m────╮ ╰╯ ╭──────\u001b[m",
+        "",
+        "\u001b[2mnone\u001b[m — no plumb daemon is running for this account",
+        "",
+        "  no plumb daemon process was found for this account"
+      ],
+      "expect": []
+    },
+    {
+      "name": "an UNKNOWN verdict with no table",
+      "lines": [
+        "\u001b[33mUNKNOWN\u001b[m — the process table could not be read",
+        "",
+        "  \u001b[33m!\u001b[m unknown: ps exited 1"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an unknown: line after a table (the census could not read everything)",
+      "lines": [
+        "\u001b[33mUNKNOWN\u001b[m — a process could not be read",
+        "",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "  \u001b[33m!\u001b[m unknown: pid 50211: could not read its argv"
+      ],
+      "expect": null
+    },
+    {
+      "name": "empty output",
+      "lines": [
+      ],
+      "expect": null
+    },
+    {
+      "name": "garbage",
+      "lines": [
+        "hello",
+        "this is not a table"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a header and no row",
+      "lines": [
+        "  PID  PPID  STARTED  EXECUTABLE  AUTHORITY  SOCKET  FOUND BY"
+      ],
+      "expect": null
+    },
+    {
+      "name": "two headers",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a header and the no-daemon line",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "",
+        "  no plumb daemon process was found for this account"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a row cut off before the AUTHORITY column",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  "
+      ],
+      "expect": null
+    },
+    {
+      "name": "a PID that is not a number",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48x03  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "PID 0",
+      "lines": [
+        "  PID  PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  0    1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a PID with a leading zero",
+      "lines": [
+        "  PID     PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  048103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a PID too large to be exact",
+      "lines": [
+        "  PID                   PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  99999999999999999999  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an AUTHORITY cell that is neither yes nor a dash",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  maybe      yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "an AUTHORITY cell with more after yes",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes!       yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "AUTHORITY YES is not exact",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  YES        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "columns that do not line up with the header",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103 1      2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "a row wider than the header's columns",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb-extra  yes        yes     authority"
+      ],
+      "expect": null
+    },
+    {
+      "name": "the same PID twice",
+      "lines": [
+        "  PID    PPID  STARTED                    EXECUTABLE               AUTHORITY  SOCKET  FOUND BY",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority",
+        "  48103  1     2026-10-16T10:17:10+11:00  /opt/homebrew/bin/plumb  yes        yes     authority"
+      ],
+      "expect": null
+    }
+  ]
+}
