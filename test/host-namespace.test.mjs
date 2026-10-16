@@ -198,6 +198,16 @@ test('hostDecision: a listing that cannot be read is a refusal', () => {
   }
 })
 
+test('hostDecision: no daemon and two daemons are each named as such', () => {
+  for (const [rows, count] of [[[], 0], [[{ pid: 48103, authority: true }, { pid: 50211, authority: false }], 2]]) {
+    const s = spies({ daemons: rows })
+    const decision = hostDecision({ env: { DSH_E2E_HOST_DAEMON: '48103' }, separate: null, isolation: s.isolation, probePassed: s.probePassed, daemons: s.daemons })
+    assert.equal(decision.allow, false)
+    assert.equal(decision.condition, 'daemons')
+    assert.match(decision.why, new RegExp(`lists ${count} daemons; DSH_E2E_HOST_DAEMON needs exactly one`))
+  }
+})
+
 test('hostDecision: every condition met allows, and names the daemon', () => {
   const s = spies()
   const decision = hostDecision({ env: { DSH_E2E_HOST_DAEMON: '48103' }, separate: null, isolation: s.isolation, probePassed: s.probePassed, daemons: s.daemons })
